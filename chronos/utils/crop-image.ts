@@ -45,3 +45,19 @@ export async function cropImageToBuffer(imgPath: string, bbox: Bbox): Promise<Bu
   const { left, top, cropW, cropH } = bboxToPixels(bbox, width, height);
   return img.extract({ left, top, width: cropW, height: cropH }).png().toBuffer();
 }
+
+/**
+ * Downscale a PNG so its long edge is at most `maxDim` pixels. Returns the
+ * input buffer unchanged when it is already within the cap (no re-encode) or
+ * when maxDim is 0 (disabled). Aspect ratio is preserved.
+ */
+export async function downscaleToLimit(png: Buffer, maxDim: number): Promise<Buffer> {
+  if (maxDim <= 0) return png;
+  const img = sharp(png);
+  const { width, height } = await img.metadata();
+  if (!width || !height || Math.max(width, height) <= maxDim) return png;
+  return img
+    .resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true })
+    .png()
+    .toBuffer();
+}
