@@ -20,6 +20,7 @@ import {
   countPartialPages,
   findIncompleteImports,
 } from "./import-status";
+import { TRACE_ENTITY_SKILL } from "./workspace-templates";
 
 // pi's npm package. @mariozechner/pi-coding-agent is deprecated and frozen at
 // 0.73.1 ("use @earendil-works/pi-coding-agent going forward"); the renamed
@@ -276,7 +277,7 @@ function writeIfMissing(filePath: string, content: string): void {
 
 async function initWorkspace(folder: string): Promise<boolean> {
   // Create directory structure
-  for (const dir of ["sources", "memory", "skills", "sessions", ".chronos", ".pi"]) {
+  for (const dir of ["sources", "memory", "skills", "sessions", "collections", ".chronos", ".pi"]) {
     mkdirSync(join(folder, dir), { recursive: true });
   }
 
@@ -290,6 +291,10 @@ async function initWorkspace(folder: string): Promise<boolean> {
   // Memory files
   writeIfMissing(join(folder, "memory", "MEMORY.MD"), "");
 
+  // Seed the long-horizon "trace an entity" skill (non-destructive — edits are kept).
+  mkdirSync(join(folder, "skills", "trace-entity"), { recursive: true });
+  writeIfMissing(join(folder, "skills", "trace-entity", "SKILL.md"), TRACE_ENTITY_SKILL);
+
   // README
   writeIfMissing(join(folder, "README.md"),
 `# Chronos Workspace
@@ -301,6 +306,7 @@ This folder is a Chronos workspace for digitizing historical documents.
 \`\`\`
 sources/          Place your source directories here (each with a png/ subfolder)
 data/             Per-source extraction results and outputs
+collections/      Named collection manifests (<name>.json grouping member sources)
 memory/           Agent memory files (MEMORY.MD, per-source notes)
 skills/           Skill definitions (markdown task instructions)
 sessions/         Agent session logs (auto-generated)
@@ -743,8 +749,16 @@ export function activate(context: vscode.ExtensionContext): {
         // Bind the HTTP server (lazily) so the port is assigned before the agent starts.
         await httpServer.start();
 
+        // User-tunable agent limits (contributed settings) are forwarded to the
+        // pi-package as env vars; it parses them defensively (see utils/env-config.ts).
+        const chronosCfg = vscode.workspace.getConfiguration("chronos");
         const agentEnv = {
           CHRONOS_HTTP_PORT: String(httpServer.port),
+          CHRONOS_MAX_EXPERT_TOOL_CALLS: String(chronosCfg.get<number>("maxExpertToolCalls", 100)),
+          CHRONOS_MAX_CONCURRENCY: String(chronosCfg.get<number>("maxConcurrency", 20)),
+          CHRONOS_MAX_IMAGE_DIMENSION: String(chronosCfg.get<number>("maxImageDimension", 2576)),
+          CHRONOS_EXPERT_RETRIES: String(chronosCfg.get<number>("expertRetries", 3)),
+          CHRONOS_EXPERT_TIMEOUT: String(chronosCfg.get<number>("expertRequestTimeout", 300)),
           // pi >= 0.7x dropped the session_directory extension hook; this env var
           // keeps session transcripts inside the workspace in both UI modes.
           PI_CODING_AGENT_SESSION_DIR: join(workspaceFolder, "sessions"),
