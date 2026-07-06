@@ -17,6 +17,7 @@ import { resolveExpertModel } from "../utils/resolve-model.js";
 import { cropImageToBuffer, downscaleToLimit, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
 import { envInt } from "../utils/env-config.js";
+import { completeWithRetry } from "../utils/expert-retry.js";
 import {
   buildExpertTools,
   executeExpertTool,
@@ -40,6 +41,13 @@ const HARD_TOOL_CALL_CEILING = MAX_EXPERT_TOOL_CALLS + 3;
 // as CHRONOS_MAX_IMAGE_DIMENSION; 0 disables. view_region crops are cut from
 // the full-resolution file first, so expert zooming keeps full detail.
 const MAX_IMAGE_DIMENSION = envInt("CHRONOS_MAX_IMAGE_DIMENSION", 2576, 0, 100_000);
+// Retry/timeout policy for expert LLM calls (`chronos.expertRetries` /
+// `chronos.expertRequestTimeout` settings). The timeout bounds each attempt's
+// HTTP request AND stream idleness (pi-ai forwards it to the provider SDK),
+// so a stalled upload or dead stream can't hold a batch slot for the SDK's
+// 10-minute default. 0 retries / 0 timeout restore the old behavior.
+const EXPERT_RETRIES = envInt("CHRONOS_EXPERT_RETRIES", 3, 0, 10);
+const EXPERT_TIMEOUT_S = envInt("CHRONOS_EXPERT_TIMEOUT", 300, 0, 3600);
 
 const CAP_DESCRIPTION: Record<ExpertCapability, string> = {
   bash: "run shell commands",
@@ -264,20 +272,31 @@ export async function runExpertTurn(
     if (input.signal?.aborted) {
       return { ok: false, taskId, error: "Expert turn aborted." };
     }
-    const response = await complete(
-      resolved.model,
-      {
-        systemPrompt: pageExpertPrompt,
-        messages: [...session.messages, ...turnMessages],
-        tools: toolsEnabled ? expertToolDefs : undefined,
-      },
-      { apiKey: resolved.apiKey, headers: resolved.headers, signal: input.signal },
+    const { response, attempts } = await completeWithRetry(
+      () =>
+        complete(
+          resolved.model,
+          {
+            systemPrompt: pageExpertPrompt,
+            messages: [...session.messages, ...turnMessages],
+            tools: toolsEnabled ? expertToolDefs : undefined,
+          },
+          {
+            apiKey: resolved.apiKey,
+            headers: resolved.headers,
+            signal: input.signal,
+            ...(EXPERT_TIMEOUT_S > 0 ? { timeoutMs: EXPERT_TIMEOUT_S * 1000 } : {}),
+          },
+        ),
+      { retries: EXPERT_RETRIES },
+      input.signal,
     );
     if (response.stopReason === "error") {
+      const attemptNote = attempts > 1 ? ` (after ${attempts} attempts)` : "";
       return {
         ok: false,
         taskId,
-        error: `Expert model error (${modelSpec(resolved.model)}): ${response.errorMessage ?? "unknown error"}`,
+        error: `Expert model error (${modelSpec(resolved.model)}): ${response.errorMessage ?? "unknown error"}${attemptNote}`,
       };
     }
     // A cancel that lands while complete() is in flight resolves with an
