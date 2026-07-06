@@ -11,20 +11,35 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pageIdToPath } from "../utils/page-files.js";
 import type { ExpertRegistry, ExpertSession } from "./expert-registry.js";
 import { newTaskId } from "./expert-registry.js";
-import type { SourceContext } from "./source-context.js";
-import { requireSource } from "./source-context.js";
+import type { CollectionContext } from "./collection-context.js";
+import { resolveSource } from "./collection-context.js";
 import { resolveExpertModel } from "../utils/resolve-model.js";
-import { cropImageToBase64, type Bbox } from "../utils/crop-image.js";
+import { cropImageToBuffer, downscaleToLimit, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
+import { envInt } from "../utils/env-config.js";
 import {
   buildExpertTools,
   executeExpertTool,
+  outputOnlyTools,
   rehydrateToolResult,
   type ExpertCapability,
 } from "./expert-tools.js";
 
 // Bound the per-turn agentic loop so a confused expert can't spin on tool calls.
-const MAX_EXPERT_TOOL_CALLS = 8;
+// User-configurable via the extension's `chronos.maxExpertToolCalls` setting,
+// forwarded as CHRONOS_MAX_EXPERT_TOOL_CALLS; defaults to 100.
+const MAX_EXPERT_TOOL_CALLS = envInt("CHRONOS_MAX_EXPERT_TOOL_CALLS", 100, 1, 1000);
+// Absolute ceiling: past the exploratory budget an output-owing expert keeps only
+// save_output (a few retries for invalid JSON), but this hard-stops all tools so
+// the loop always terminates even if it keeps calling save_output.
+const HARD_TOOL_CALL_CEILING = MAX_EXPERT_TOOL_CALLS + 3;
+// Cap the long edge of every image sent to expert models. Providers resize
+// past their own pixel caps anyway (Anthropic: 2576px on Opus 4.7+), so
+// larger uploads are pure wasted bandwidth — at batch concurrency they can
+// saturate the user's uplink. `chronos.maxImageDimension` setting, forwarded
+// as CHRONOS_MAX_IMAGE_DIMENSION; 0 disables. view_region crops are cut from
+// the full-resolution file first, so expert zooming keeps full detail.
+const MAX_IMAGE_DIMENSION = envInt("CHRONOS_MAX_IMAGE_DIMENSION", 2576, 0, 100_000);
 
 const CAP_DESCRIPTION: Record<ExpertCapability, string> = {
   bash: "run shell commands",
@@ -68,11 +83,14 @@ export async function pageImageContent(sourceDir: string, pageId: number, bbox?:
   if (!existsSync(imgPath)) {
     throw new Error(`Page ${String(pageId).padStart(4, "0")} not found: ${imgPath}`);
   }
-  const data = bbox ? await cropImageToBase64(imgPath, bbox) : readFileSync(imgPath).toString("base64");
-  return { type: "image", data, mimeType: "image/png" };
+  const raw = bbox ? await cropImageToBuffer(imgPath, bbox) : readFileSync(imgPath);
+  const capped = await downscaleToLimit(raw, MAX_IMAGE_DIMENSION);
+  return { type: "image", data: capped.toString("base64"), mimeType: "image/png" };
 }
 
 export interface ExpertTurnInput {
+  /** Collection member ref the expert works on. Always provided (the tools require it). */
+  source: string;
   /** Continue an existing session; omit to spawn a new one. */
   taskId?: string;
   prompt: string;
@@ -89,6 +107,13 @@ export interface ExpertTurnInput {
    * the caller is responsible for getting the user's confirmation first.
    */
   grantedCaps?: ExpertCapability[];
+  /**
+   * Absolute path the expert must write its result to via `save_output`
+   * (pre-resolved by the caller from output_file). When set, the expert is given
+   * the save_output tool and told to use it; the turn no longer returns its raw
+   * text as the file's contents. Undefined for inline (return-text) tasks.
+   */
+  outputPath?: string;
 }
 
 /** One tool the expert invoked during a turn — surfaced to the UI for oversight. */
@@ -111,6 +136,9 @@ export type ExpertTurnResult =
       pageId: number | null;
       /** view_region/view_page calls the expert made this turn (in order). */
       toolUses: ExpertToolUse[];
+      /** True when an output_file was owed and the expert wrote it via save_output.
+       *  Always false for inline tasks (no output_file). */
+      wroteOutput: boolean;
     }
   | { ok: false; error: string; taskId?: string };
 
@@ -127,13 +155,22 @@ function isToolCall(c: { type: string }): c is ToolCall {
  */
 export async function runExpertTurn(
   registry: ExpertRegistry,
-  sourceCtx: SourceContext,
+  collectionCtx: CollectionContext,
   pageExpertPrompt: string,
   extCtx: ExtensionContext,
   input: ExpertTurnInput,
 ): Promise<ExpertTurnResult> {
   if (input.bbox && input.pageId === undefined) {
     return { ok: false, error: "bbox requires page_id." };
+  }
+
+  // Resolve the source up-front — it scopes both the attached page image and the
+  // expert's own view_page/view_region tools. A source is always given now.
+  let sourceDir: string;
+  try {
+    sourceDir = resolveSource(collectionCtx, input.source).path;
+  } catch (e) {
+    return { ok: false, taskId: input.taskId, error: (e as Error).message };
   }
 
   // Resolve the session first so a follow-up can default to its model.
@@ -151,23 +188,32 @@ export async function runExpertTurn(
   }
 
   // Build the user message; attach a page image only when page_id is given.
+  // The expert's tools always reach the resolved source, image or not.
   const content: (TextContent | ImageContent)[] = [];
   let pageId: number | null = null;
-  let turnSourceDir: string | undefined;
+  const turnSourceDir: string = sourceDir;
   if (input.pageId !== undefined) {
-    const sourceDir = requireSource(sourceCtx);
     pageId = Math.round(input.pageId);
     try {
       content.push(await pageImageContent(sourceDir, pageId, input.bbox));
     } catch (e) {
       return { ok: false, taskId, error: (e as Error).message };
     }
-    turnSourceDir = sourceDir;
-  } else if (sourceCtx.sourceDir) {
-    // No image attached, but a source is active — let the expert's tools reach it.
-    turnSourceDir = sourceCtx.sourceDir;
   }
-  content.push({ type: "text", text: input.prompt });
+  // When an output_file is owed, direct the expert to write via save_output. The
+  // directive is appended to the sent message only; the persisted turn keeps the
+  // clean `input.prompt` (below) so restored history isn't cluttered with it.
+  let promptText = input.prompt;
+  if (input.outputPath) {
+    const jsonHint = input.outputPath.toLowerCase().endsWith(".json")
+      ? " The output file is JSON: pass a single valid JSON value (no code fences, no prose)."
+      : "";
+    promptText +=
+      "\n\n[Output file] You MUST call save_output with your final result — the complete content " +
+      "to write to the output file. Your chat reply is for reasoning only and is NOT saved." +
+      jsonHint;
+  }
+  content.push({ type: "text", text: promptText });
 
   // Default to the session's model on follow-up, else the orchestrator's current
   // model (whatever the user has selected/authed in pi) — no provider is baked in.
@@ -203,12 +249,15 @@ export async function runExpertTurn(
   // consume images; bash/write/edit only for capabilities the orchestrator
   // granted (and the user approved upstream).
   const granted = new Set<ExpertCapability>(input.grantedCaps ?? []);
-  const expertToolDefs = buildExpertTools({
+  const outputMode = !!input.outputPath;
+  let expertToolDefs = buildExpertTools({
     vision: resolved.model.input.includes("image"),
     granted: [...granted],
+    output: outputMode,
   });
   let toolsEnabled = expertToolDefs.length > 0;
   let totalCost = 0;
+  let wroteOutput = false;
   let finalResponse;
 
   for (;;) {
@@ -254,13 +303,26 @@ export async function runExpertTurn(
         currentPageId,
         cwd: extCtx.cwd,
         granted,
+        outputPath: input.outputPath,
       });
       turnMessages.push(outcome.message);
       steps.push({ kind: "toolResult", toolResult: outcome.persist });
       if (outcome.viewedPageId !== undefined) currentPageId = outcome.viewedPageId;
+      if (outcome.wroteOutput) wroteOutput = true;
     }
-    // Spent the budget — drop tools so the next completion must answer in text.
-    if (toolCallCount >= MAX_EXPERT_TOOL_CALLS) toolsEnabled = false;
+    // Spent the budget — stop the exploratory tools so the next completion must
+    // answer. When an output_file is still owed, keep ONLY save_output (within a
+    // small grace window) so the expert can still fulfill its contract instead of
+    // being stranded; the hard ceiling then cuts everything off so the loop ends.
+    if (toolCallCount >= HARD_TOOL_CALL_CEILING) {
+      toolsEnabled = false;
+    } else if (toolCallCount >= MAX_EXPERT_TOOL_CALLS) {
+      if (outputMode) {
+        expertToolDefs = outputOnlyTools();
+      } else {
+        toolsEnabled = false;
+      }
+    }
   }
 
   session.messages.push(...turnMessages);
@@ -301,6 +363,7 @@ export async function runExpertTurn(
     cost: totalCost > 0 ? totalCost : undefined,
     pageId,
     toolUses,
+    wroteOutput,
   };
 }
 
