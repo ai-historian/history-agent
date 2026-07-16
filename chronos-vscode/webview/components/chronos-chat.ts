@@ -149,7 +149,9 @@ function taskReplyText(item: ToolItem): string {
 
 interface BatchExpertEntry {
   taskId?: string;
-  page_id: number;
+  key?: string;
+  label?: string;
+  page_id?: number;
   /** queued/running only appear in live (partial) results while the batch runs. */
   status: "queued" | "running" | "ok" | "error";
   response?: string;
@@ -1167,7 +1169,7 @@ export class ChronosChat extends LitElement {
         title=${title}
         @click=${() => clickable && (this.openExpert = e.taskId!)}
       >
-        <span class="expert-chip-page">p. ${e.page_id}</span>
+        <span class="expert-chip-page">${e.label ?? (e.page_id != null ? `p. ${e.page_id}` : "—")}</span>
         <span class="expert-chip-foot">
           <span class="expert-chip-task">${foot}</span>
           <span class="expert-chip-dot is-${e.status}" aria-hidden="true"></span>
