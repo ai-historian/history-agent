@@ -12,7 +12,7 @@ import { pageIdToPath } from "../utils/page-files.js";
 import type { ExpertRegistry, ExpertSession } from "./expert-registry.js";
 import { newTaskId } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
-import { resolveSource } from "./collection-context.js";
+import { resolveSource, deriveRef } from "./collection-context.js";
 import { resolveExpertModel } from "../utils/resolve-model.js";
 import { cropImageToBuffer, downscaleToLimit, loadImageAsPng, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
@@ -218,22 +218,10 @@ export async function runExpertTurn(
   if (input.bbox && input.pageId === undefined) {
     return { ok: false, error: "bbox requires page_id." };
   }
-  if (input.pageId !== undefined && !input.source) {
-    return { ok: false, error: "page_id requires a source." };
-  }
 
-  // Resolve the source up-front only when one is given. It scopes the attached
-  // page image and the expert's own view_page/view_region tools.
-  let sourceDir: string | undefined;
-  if (input.source) {
-    try {
-      sourceDir = resolveSource(collectionCtx, input.source).path;
-    } catch (e) {
-      return { ok: false, taskId: input.taskId, error: (e as Error).message };
-    }
-  }
-
-  // Resolve the session first so a follow-up can default to its model.
+  // Resolve the session first so a follow-up can default to its model AND its
+  // source. A follow-up that omits `source` inherits the session's remembered
+  // source, so it keeps its source-scoped view_page/view_region tools.
   let session: ExpertSession | undefined;
   let taskId = input.taskId;
   if (taskId) {
@@ -244,6 +232,25 @@ export async function runExpertTurn(
         ok: false,
         error: `Unknown task_id "${taskId}". Active tasks: ${active.length > 0 ? active.join(", ") : "(none)"}.`,
       };
+    }
+  }
+
+  // The source in effect this turn: an explicit `source` overrides; otherwise a
+  // follow-up inherits the session's remembered source.
+  const effectiveSource = input.source ?? session?.sourceRef;
+
+  if (input.pageId !== undefined && !effectiveSource) {
+    return { ok: false, taskId, error: "page_id requires a source." };
+  }
+
+  // Resolve the source up-front only when one is in effect. It scopes the attached
+  // page image and the expert's own view_page/view_region tools.
+  let sourceDir: string | undefined;
+  if (effectiveSource) {
+    try {
+      sourceDir = resolveSource(collectionCtx, effectiveSource).path;
+    } catch (e) {
+      return { ok: false, taskId, error: (e as Error).message };
     }
   }
 
@@ -294,10 +301,11 @@ export async function runExpertTurn(
 
   if (!session) {
     taskId = newTaskId(registry);
-    session = { messages: [], model: resolved.model };
+    session = { messages: [], model: resolved.model, sourceRef: effectiveSource };
     registry.sessions.set(taskId, session);
   } else {
     session.model = resolved.model;
+    if (effectiveSource) session.sourceRef = effectiveSource;
   }
 
   const userMessage: UserMessage = { role: "user", content, timestamp: Date.now() };
@@ -494,7 +502,9 @@ export async function restoreExpertSessions(
     }
     const resolved = await resolveExpertModel(rec.modelSpec, extCtx.modelRegistry, undefined, false);
     if (!resolved.ok) continue;
-    registry.sessions.set(rec.taskId, { messages, model: resolved.model });
+    const lastSourced = [...rec.turns].reverse().find((t) => t.sourceDir);
+    const sourceRef = lastSourced?.sourceDir ? deriveRef(extCtx.cwd, lastSourced.sourceDir) : undefined;
+    registry.sessions.set(rec.taskId, { messages, model: resolved.model, sourceRef });
     const n = parseInt(rec.taskId.replace(/^task-/, ""), 10);
     if (!isNaN(n) && n > maxId) maxId = n;
   }

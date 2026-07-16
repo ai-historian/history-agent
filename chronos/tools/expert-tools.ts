@@ -204,6 +204,26 @@ export function resolveImagePath(workspaceRoot: string, p: string): string {
   return abs;
 }
 
+/**
+ * Resolve a task/task_batch `output_file` to an absolute path, enforcing the same
+ * containment policy as `resolveInWorkspace`: it must stay inside the workspace and
+ * out of dot-dirs / restricted dirs (`.chronos`, `png/`, `dist/`, node_modules, …).
+ * Unlike the arbitrary-image resolver, save_output is ungated, so its target MUST
+ * be filtered. `baseDir` is where a relative output_file is anchored (a source data
+ * dir, or the workspace root for sourceless output).
+ */
+export function resolveOutputFile(workspaceRoot: string, baseDir: string, outputFile: string): string {
+  const abs = resolve(baseDir, outputFile);
+  const rel = relative(workspaceRoot, abs);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error("output_file path is outside the workspace.");
+  }
+  if (rel.split(/[\\/]/).some((seg) => seg.startsWith(".") || SKIP_DIRS.has(seg))) {
+    throw new Error("output_file path is in a restricted directory.");
+  }
+  return abs;
+}
+
 export interface ExpertToolImageRef {
   pageId: number;
   bbox?: Bbox;

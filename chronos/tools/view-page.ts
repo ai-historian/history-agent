@@ -1,11 +1,11 @@
-import { join, relative } from "node:path";
+import { relative } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExpertRegistry } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
 import { requireSourceDataDir, resolveSource } from "./collection-context.js";
 import { runExpertTurn, confirmExpertGrant } from "./expert-turn.js";
-import { resolveImagePath, type ExpertCapability } from "./expert-tools.js";
+import { resolveImagePath, resolveOutputFile, type ExpertCapability } from "./expert-tools.js";
 
 const grantParam = Type.Optional(
   Type.Array(Type.Union([Type.Literal("bash"), Type.Literal("write"), Type.Literal("edit")]), {
@@ -61,10 +61,12 @@ const taskParams = Type.Object({
   output_file: Type.Optional(
     Type.String({
       description:
-        "If provided, the expert writes its result to this file in the source data directory " +
+        "If provided, the expert writes its result to this file " +
         "(e.g. 'entries_0042.json') itself, via a scoped save_output tool (JSON is validated before " +
         "writing) — its chat text is not captured. The tool returns a short confirmation; if the " +
-        "expert never calls save_output, no file is written and that is reported.",
+        "expert never calls save_output, no file is written and that is reported. " +
+        "With a source, the path is under that source's data directory; without a source, " +
+        "it is resolved workspace-relative. Restricted/escaping paths are rejected.",
     })
   ),
   bbox: Type.Optional(
@@ -133,18 +135,23 @@ export function createTaskTool(
       // just leave outputPath undefined here.
       let outputPath: string | undefined;
       if (params.output_file) {
+        // A bad source ref leaves baseDir empty so runExpertTurn reports the source
+        // error; a restricted/escaping output_file is a hard error here (run nothing).
+        let baseDir = "";
         if (params.source) {
           try {
-            outputPath = join(requireSourceDataDir(collectionCtx, params.source), params.output_file);
+            baseDir = requireSourceDataDir(collectionCtx, params.source);
           } catch {
-            outputPath = undefined;
+            baseDir = "";
           }
         } else {
-          // Sourceless: treat output_file as a workspace-relative path.
+          baseDir = collectionCtx.workspaceDir;
+        }
+        if (baseDir) {
           try {
-            outputPath = resolveImagePath(collectionCtx.workspaceDir, params.output_file);
-          } catch {
-            outputPath = undefined;
+            outputPath = resolveOutputFile(collectionCtx.workspaceDir, baseDir, params.output_file);
+          } catch (e) {
+            return { content: [{ type: "text", text: (e as Error).message }], details: {} };
           }
         }
       }

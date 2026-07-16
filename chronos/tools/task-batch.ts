@@ -1,4 +1,4 @@
-import { join, relative } from "node:path";
+import { relative } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExpertRegistry } from "./expert-registry.js";
@@ -6,7 +6,7 @@ import type { CollectionContext } from "./collection-context.js";
 import { resolveSource } from "./collection-context.js";
 import type { ToolText } from "../utils/tool-loader.js";
 import { runExpertTurn, confirmExpertGrant, type ExpertTurnInput, type ExpertToolUse } from "./expert-turn.js";
-import { resolveImagePath, type ExpertCapability } from "./expert-tools.js";
+import { resolveImagePath, resolveOutputFile, type ExpertCapability } from "./expert-tools.js";
 import { type Bbox } from "../utils/crop-image.js";
 import { envInt } from "../utils/env-config.js";
 
@@ -44,8 +44,9 @@ const taskBatchParams = Type.Object({
   source: Type.Optional(
     Type.String({
       description:
-        "Collection member ref every expert in this batch works on. Required when using page_ids; " +
-        "optional (and unused) when using images.",
+        "Collection member ref every expert works on. Required when using page_ids. " +
+        "With images it is optional: if it resolves, each expert also gets that source's " +
+        "view_page/view_region tools; a bad/absent ref is ignored.",
     }),
   ),
   page_ids: Type.Optional(
@@ -263,11 +264,18 @@ export function createTaskBatchTool(
               .replace("{index}", String(item.sortIndex + 1).padStart(4, "0"))
               .replace("{name}", item.label.replace(/\.[^.]+$/, ""))
           : undefined;
-        const outputPath = filename
-          ? item.pageId !== undefined && member
-            ? join(member.dataDir, filename)
-            : join(collectionCtx.workspaceDir, filename)
-          : undefined;
+        let outputPath: string | undefined;
+        if (filename) {
+          const baseDir = item.pageId !== undefined && member ? member.dataDir : collectionCtx.workspaceDir;
+          try {
+            outputPath = resolveOutputFile(collectionCtx.workspaceDir, baseDir, filename);
+          } catch (e) {
+            const errEntry: ExpertEntry = { key: item.key, label: item.label, page_id: item.pageId, status: "error", error: (e as Error).message };
+            live.set(item.key, { ...errEntry });
+            scheduleEmit();
+            return errEntry;
+          }
+        }
         const entry = live.get(item.key)!;
         entry.status = "running";
         scheduleEmit();
