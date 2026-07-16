@@ -5,7 +5,7 @@ import type { ExpertRegistry } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
 import { requireSourceDataDir, resolveSource } from "./collection-context.js";
 import { runExpertTurn, confirmExpertGrant } from "./expert-turn.js";
-import type { ExpertCapability } from "./expert-tools.js";
+import { resolveImagePath, type ExpertCapability } from "./expert-tools.js";
 
 const grantParam = Type.Optional(
   Type.Array(Type.Union([Type.Literal("bash"), Type.Literal("write"), Type.Literal("edit")]), {
@@ -18,11 +18,23 @@ const grantParam = Type.Optional(
 );
 
 const taskParams = Type.Object({
-  source: Type.String({
-    description:
-      "Collection member ref the expert works on (see the catalog in the system prompt). " +
-      "Required — the expert's page image and its view_page/view_region tools are scoped to this source.",
-  }),
+  source: Type.Optional(
+    Type.String({
+      description:
+        "Collection member ref the expert works on (see the catalog in the system prompt). " +
+        "Optional: required only when you pass page_id, or when the expert should have source-scoped " +
+        "view_page/view_region. Omit for a task on an arbitrary `image` or a plain (text-only) task.",
+    }),
+  ),
+  image: Type.Optional(
+    Type.String({
+      description:
+        "Attach an arbitrary image file by path (workspace-relative, inside the workspace). Use this for " +
+        "a picture that is not a cataloged source page. Mutually exclusive with page_id. Any common image " +
+        "format is accepted (normalized to PNG, downscaled to the image cap). A missing/undecodable file " +
+        "fails the task.",
+    }),
+  ),
   prompt: Type.String({ description: "What to ask the expert model." }),
   task_id: Type.Optional(
     Type.String({
@@ -95,15 +107,45 @@ export function createTaskTool(
           details: {},
         };
       }
+      if (params.image && params.page_id !== undefined) {
+        return {
+          content: [{ type: "text", text: "`image` and `page_id` are mutually exclusive — pass only one." }],
+          details: {},
+        };
+      }
+      if (params.page_id !== undefined && !params.source) {
+        return {
+          content: [{ type: "text", text: "`page_id` requires a `source`." }],
+          details: {},
+        };
+      }
+      let imagePath: string | undefined;
+      if (params.image) {
+        try {
+          imagePath = resolveImagePath(collectionCtx.workspaceDir, params.image);
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], details: {} };
+        }
+      }
+
       // Pre-resolve the output path the expert will write to via save_output. If
       // the source ref is bad, runExpertTurn returns the proper error below, so
       // just leave outputPath undefined here.
       let outputPath: string | undefined;
       if (params.output_file) {
-        try {
-          outputPath = join(requireSourceDataDir(collectionCtx, params.source), params.output_file);
-        } catch {
-          outputPath = undefined;
+        if (params.source) {
+          try {
+            outputPath = join(requireSourceDataDir(collectionCtx, params.source), params.output_file);
+          } catch {
+            outputPath = undefined;
+          }
+        } else {
+          // Sourceless: treat output_file as a workspace-relative path.
+          try {
+            outputPath = resolveImagePath(collectionCtx.workspaceDir, params.output_file);
+          } catch {
+            outputPath = undefined;
+          }
         }
       }
 
@@ -114,6 +156,7 @@ export function createTaskTool(
         model: params.model,
         pageId: params.page_id,
         bbox: params.bbox,
+        imagePath,
         signal,
         grantedCaps: grant,
         outputPath,
@@ -157,10 +200,12 @@ export function createTaskTool(
       // chips open this task's source, not whichever was shown last. The turn
       // succeeded, so params.source resolves; guard anyway.
       let sourceRel = "";
-      try {
-        sourceRel = relative(collectionCtx.workspaceDir, resolveSource(collectionCtx, params.source).path);
-      } catch {
-        sourceRel = "";
+      if (params.source) {
+        try {
+          sourceRel = relative(collectionCtx.workspaceDir, resolveSource(collectionCtx, params.source).path);
+        } catch {
+          sourceRel = "";
+        }
       }
       const src = sourceRel ? `@${sourceRel}` : "";
       const viewLink =
