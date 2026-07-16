@@ -39,14 +39,18 @@ export function ensureWorkspace(workspaceDir: string) {
 
   mkdirSync(join(workspaceDir, "sources"), { recursive: true });
   mkdirSync(join(workspaceDir, "skills"), { recursive: true });
+  // collections/ holds optional <name>.json manifests (named source sets)
+  mkdirSync(join(workspaceDir, "collections"), { recursive: true });
 
   // .chronos/ holds the API key (.env)
   const chronosDir = join(workspaceDir, ".chronos");
   mkdirSync(chronosDir, { recursive: true });
 
-  // memory/ holds workspace-level MEMORY.MD and per-source document memory
+  // memory/ holds workspace-level MEMORY.MD, per-source <ref>.md, and
+  // collections/<key>.md (cross-source, long-horizon findings).
   const memoryDst = join(workspaceDir, "memory");
   mkdirSync(memoryDst, { recursive: true });
+  mkdirSync(join(memoryDst, "collections"), { recursive: true });
   writeIfMissing(join(memoryDst, "MEMORY.MD"), "");
 
   if (isNew) {

@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type {
   AgentEvent,
   RpcCommand,
@@ -54,7 +56,18 @@ export class PiRpcSession {
     if (this.proc) throw new Error("PiRpcSession already started");
     this.stopped = false;
 
-    this.proc = spawn(this.options.piBin, ["--mode", "rpc"], {
+    // Load the workspace skills/ dir explicitly via --skill. We can't rely on
+    // the workspace .pi/settings.json {skills:["../skills"]} bridge here: pi
+    // gates project settings behind project-trust, and in headless rpc mode
+    // there is no UI to answer the trust prompt (defaultProjectTrust "ask" ->
+    // untrusted), so the bridge is silently discarded and workspace skills never
+    // reach the slash-command menu. --skill is a CLI resource path, not project
+    // settings, so it loads regardless of trust state.
+    const args = ["--mode", "rpc"];
+    const skillsDir = join(this.options.workspaceDir, "skills");
+    if (existsSync(skillsDir)) args.push("--skill", skillsDir);
+
+    this.proc = spawn(this.options.piBin, args, {
       cwd: this.options.workspaceDir,
       env: { ...process.env, ...this.options.env },
       stdio: ["pipe", "pipe", "pipe"],

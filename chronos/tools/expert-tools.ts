@@ -8,6 +8,11 @@
  * edit), but that path is gated behind a human confirmation (see view-page.ts /
  * task-batch.ts) and is off by default so expert work stays auditable.
  *
+ * Separately, when a task is given an `output_file`, the expert also gets a
+ * `save_output` tool scoped to that one pre-resolved path — the model never names
+ * a path, so it needs no grant. That is how structured output is written now (the
+ * caller no longer captures the model's raw text).
+ *
  * The `Tool` shape pi-ai consumes is only `{ name, description, parameters }` —
  * execution is the caller's job, handled by `executeExpertTool` below.
  */
@@ -133,6 +138,28 @@ const ELEVATED_TOOLS: Record<ExpertCapability, Tool> = {
   edit: EDIT_FILE_TOOL,
 };
 
+// ── Output tool (only added when the task was given an output_file) ───────────
+// Not an elevated capability: it can only ever touch the one pre-resolved output
+// path (the model never names a path), so it is auditable by construction and
+// needs no `grant`/human confirmation.
+
+const SAVE_OUTPUT_TOOL: Tool = {
+  name: "save_output",
+  description:
+    "Write your final result to this task's output file. Pass the COMPLETE content (e.g. a JSON " +
+    "array of records) — it replaces the file, so call it again with corrected content to revise. " +
+    "Your chat reply is for reasoning only and is NOT saved; the output file holds only what you " +
+    "pass here. If the output file is JSON, `content` must be valid JSON or the write is rejected " +
+    "and you must retry.",
+  parameters: Type.Object({ content: Type.String({ description: "Full contents to write to the output file." }) }),
+};
+
+/** The tool set an expert is left with once its exploratory budget is spent but
+ *  an output_file is still owed — only save_output, so it can fulfill the contract. */
+export function outputOnlyTools(): Tool[] {
+  return [SAVE_OUTPUT_TOOL];
+}
+
 const ELEVATED_TOOL_NAMES: Record<string, ExpertCapability> = {
   bash: "bash",
   write_file: "write",
@@ -144,7 +171,7 @@ const ELEVATED_TOOL_NAMES: Record<string, ExpertCapability> = {
  * image tools only when the model can consume images, and the elevated tools
  * only for capabilities the orchestrator granted (and the user approved).
  */
-export function buildExpertTools(opts: { vision: boolean; granted: ExpertCapability[] }): Tool[] {
+export function buildExpertTools(opts: { vision: boolean; granted: ExpertCapability[]; output: boolean }): Tool[] {
   const tools: Tool[] = [];
   if (opts.vision) tools.push(VIEW_REGION_TOOL, VIEW_PAGE_TOOL);
   tools.push(READ_FILE_TOOL, LIST_DIR_TOOL, GREP_TOOL);
@@ -152,6 +179,7 @@ export function buildExpertTools(opts: { vision: boolean; granted: ExpertCapabil
     const tool = ELEVATED_TOOLS[cap];
     if (tool && !tools.includes(tool)) tools.push(tool);
   }
+  if (opts.output) tools.push(SAVE_OUTPUT_TOOL);
   return tools;
 }
 
@@ -179,6 +207,9 @@ export interface ExpertToolContext {
   cwd: string;
   /** Capabilities the orchestrator granted (and the user approved) for this expert. */
   granted: ReadonlySet<ExpertCapability>;
+  /** Absolute path save_output writes to, pre-resolved by the caller from output_file
+   *  (undefined when the task has no output_file — save_output is then not offered). */
+  outputPath?: string;
 }
 
 export interface ExpertToolOutcome {
@@ -186,6 +217,8 @@ export interface ExpertToolOutcome {
   persist: PersistedToolResult;
   /** Page the expert is now looking at, so a later view_region can default to it. */
   viewedPageId?: number;
+  /** Set when a save_output call successfully wrote the output file this turn. */
+  wroteOutput?: boolean;
 }
 
 function coerceBbox(value: unknown): Bbox | null {
@@ -409,6 +442,40 @@ export async function executeExpertTool(call: ToolCall, ctx: ExpertToolContext):
       } catch (e) {
         return fail(`edit_file failed: ${(e as Error).message}`, p);
       }
+    }
+
+    case "save_output": {
+      if (!ctx.outputPath) {
+        return fail('save_output is not available (this task was not given an output_file).');
+      }
+      const content = typeof args.content === "string" ? args.content : "";
+      const rel = relative(ctx.cwd, ctx.outputPath);
+      // For JSON targets, validate before writing so malformed content bounces
+      // back to the expert to fix instead of landing invalid on disk. This is the
+      // whole point of the tool: no fences/prose ever reach a .json file.
+      if (ctx.outputPath.toLowerCase().endsWith(".json")) {
+        try {
+          JSON.parse(content);
+        } catch (e) {
+          return fail(
+            `save_output: content is not valid JSON (${(e as Error).message}). ` +
+              "Nothing was written — call save_output again with corrected content.",
+            rel,
+          );
+        }
+      }
+      try {
+        mkdirSync(dirname(ctx.outputPath), { recursive: true });
+        writeFileSync(ctx.outputPath, content, "utf-8");
+      } catch (e) {
+        return fail(`save_output failed: ${(e as Error).message}`, rel);
+      }
+      const note = `Saved ${content.length} chars to ${rel}.`;
+      return {
+        message: { ...base, content: [{ type: "text", text: note }], isError: false },
+        persist: { toolCallId: call.id, toolName: call.name, isError: false, text: note, detail: rel },
+        wroteOutput: true,
+      };
     }
 
     default:

@@ -34,6 +34,8 @@ export class ChronosApp extends LitElement {
     toasts: { state: true },
     splitPct: { state: true },
     currentSource: { state: true },
+    collections: { state: true },
+    activeCollection: { state: true },
     yolo: { state: true },
     contextTokens: { state: true },
     sessionLoading: { state: true },
@@ -50,6 +52,8 @@ export class ChronosApp extends LitElement {
   declare toasts: Toast[];
   declare splitPct: number;
   declare currentSource: string;
+  declare collections: { name: string; description?: string; memberCount: number }[];
+  declare activeCollection: string | null;
   declare yolo: boolean;
   declare contextTokens: number;
   declare sessionLoading: { title?: string; name: string; sizeBytes?: number } | null;
@@ -71,6 +75,8 @@ export class ChronosApp extends LitElement {
     this.toasts = [];
     this.splitPct = 52;
     this.currentSource = "";
+    this.collections = [];
+    this.activeCollection = null;
     this.yolo = false;
     this.contextTokens = 0;
     this.sessionLoading = null;
@@ -194,6 +200,10 @@ export class ChronosApp extends LitElement {
         break;
       case "sources":
         this.sources = msg.sources;
+        break;
+      case "collections":
+        this.collections = msg.collections;
+        this.activeCollection = msg.active;
         break;
       case "sessions":
         this.sessions = msg.sessions;
@@ -375,6 +385,26 @@ export class ChronosApp extends LitElement {
           <span class="brand-name">Chronos</span>
         </div>
         <div class="header-controls">
+          ${this.collections.length > 0
+            ? html`<label class="control">
+                <span class="control-label">Collection</span>
+                <select
+                  class="control-select"
+                  .value=${this.activeCollection ?? ""}
+                  @change=${(e: Event) => {
+                    const v = (e.target as HTMLSelectElement).value;
+                    this.postMessage({ type: "selectCollection", name: v === "" ? null : v });
+                  }}
+                >
+                  <option value="" ?selected=${this.activeCollection === null}>All sources</option>
+                  ${this.collections.map(
+                    (c) => html`<option value=${c.name} ?selected=${c.name === this.activeCollection}>
+                      ${c.name} (${c.memberCount})
+                    </option>`,
+                  )}
+                </select>
+              </label>`
+            : nothing}
           <label class="control">
             <span class="control-label">Source</span>
             <select

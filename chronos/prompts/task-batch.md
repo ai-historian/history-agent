@@ -20,10 +20,10 @@ In a single message, you must present a complete plan of action to the user, inc
 * The Prompt: The exact and complete prompt that will be sent for each page, presented clearly in a code block.
 * The Model: The name of the model that will be used, and an explanation why this is the right model for the task.
 * The Output Plan: A clear statement on where the results will be delivered.
- * *(If writing to files)*: "The result for each page will be written to a file in the source data directory using the template: [filename_template]."
+ * *(If writing to files)*: "Each page's expert will write its own result to a file in the source data directory (via its scoped save_output tool) using the template: [filename_template]."
  * *(If returning to agent)*: "The results will be returned directly to me for immediate processing and consolidation."
 
-Output format for the Data tab: when the batch extracts structured records, prompt each expert to return a JSON array of row objects and to stamp every row with `chronos_page` (that page's page_id — different per task) and, where it helps, `chronos_bbox` as `[x,y,w,h]` normalized 0–1. A row that cites several regions/pages may make these keys lists (aligned by index). The Chronos Data tab then renders each output file as a table whose rows link back to their source page/region. (See "Structured data output" in the system prompt.)
+Output format for the Data tab: when the batch extracts structured records, prompt each expert to produce a JSON array of row objects and to stamp every row with `chronos_page` (that page's page_id — different per task) and, where it helps, `chronos_bbox` as `[x,y,w,h]` normalized 0–1. With `output_file` set, each expert writes that JSON to its own file via `save_output` (validated before writing), so you don't need to demand "only JSON, no fences". A row that cites several regions/pages may make these keys lists (aligned by index). The Chronos Data tab then renders each output file as a table whose rows link back to their source page/region. (See "Structured data output" in the system prompt.)
 
 Step 2: Request for Final Go/No-Go Confirmation
 End your proposal with a direct, unambiguous question requiring a final confirmation from the user. For example:

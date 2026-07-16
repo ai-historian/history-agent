@@ -7,7 +7,7 @@ import { PiRpcSession } from "../rpc/pi-rpc-session";
 import type { ModelInfo, RpcExtensionUIRequest, RpcSessionState, RpcSlashCommand } from "../rpc/rpc-types";
 import type { AgentToExtensionMessage } from "../protocol";
 import type { Bbox, ExtToWebview, WebviewToExt } from "./webview-protocol";
-import { discoverSources, countPages } from "./sources";
+import { discoverSources, countPages, discoverCollections } from "./sources";
 import { listSessions, readSessionMessages } from "./sessions";
 import {
   beginAnthropicLogin,
@@ -167,6 +167,15 @@ export class ChronosPanel {
   // Last source we pushed a data-file list for, so navigation within a source
   // doesn't re-list on every page change.
   private lastDataSource: string | undefined;
+  // Active collection name (null = auto "all sources"), pushed by the agent over
+  // HTTP so the collection picker reflects the current selection.
+  private activeCollection: string | null = null;
+  // The active collection's output dir (data/_collections/<key>/) whose files —
+  // e.g. the entity index — are surfaced in the Data tab alongside source data.
+  private activeCollectionDataDir: string | undefined;
+  // filename → directory it was listed from, so a data/load reads the right dir
+  // when the list merges per-source and collection-level files.
+  private dataFileDirs = new Map<string, string>();
 
   // Blocking extension_ui_requests forwarded to the webview; answered with
   // cancelled on dispose so the agent never deadlocks.
@@ -212,6 +221,7 @@ export class ChronosPanel {
    *  adds a new source) so the header picker reflects it without a reload. */
   refreshSources(): void {
     this.postSources();
+    this.postCollections();
   }
 
   // ── test seam (integration tests) ─────────────────────────────────────────
@@ -311,6 +321,7 @@ export class ChronosPanel {
     this.post({ type: "state", state });
     this.post({ type: "yolo", enabled: readChronosSettings(this.workspaceDir).yolo === true });
     this.postSources();
+    this.postCollections();
     this.postSessions();
     void this.postHistory(state);
     void this.rpc
@@ -374,6 +385,14 @@ export class ChronosPanel {
     this.post({
       type: "sources",
       sources: sources.map((s) => ({ name: s.name, pageCount: countPages(s.path) })),
+    });
+  }
+
+  private postCollections(): void {
+    this.post({
+      type: "collections",
+      collections: discoverCollections(this.workspaceDir),
+      active: this.activeCollection,
     });
   }
 
@@ -571,6 +590,13 @@ export class ChronosPanel {
           sourceName: msg.sourceName,
         });
         break;
+      case "collection":
+        this.activeCollection = msg.name;
+        this.activeCollectionDataDir = msg.dataDir;
+        this.postCollections();
+        // The collection's entity index etc. may now be visible — refresh the tab.
+        this.postDataFiles();
+        break;
       // text_delta/tool_start/tool_end/turn_end are RPC-event duplicates — dropped
     }
   }
@@ -611,6 +637,19 @@ export class ChronosPanel {
     return this.panel.webview.asWebviewUri(vscode.Uri.file(pagePath)).toString();
   }
 
+  // A cited source (from a [view …@path] link or a data row's chronos_source) to
+  // its absolute dir. Accepts an absolute path, a workspace-relative path
+  // (sources/Frankfurt_1864), or a bare ref (Frankfurt_1864) — trying the
+  // sources/ tree as a fallback so entity-index citations resolve either way.
+  private resolveCitedSource(sourcePath: string): string {
+    if (isAbsolute(sourcePath)) return sourcePath;
+    const direct = join(this.workspaceDir, sourcePath);
+    if (existsSync(join(direct, "png"))) return direct;
+    const underSources = join(this.workspaceDir, "sources", sourcePath);
+    if (existsSync(join(underSources, "png"))) return underSources;
+    return direct;
+  }
+
   // Resolve a cited page's image for the Data tab's inline crop preview, WITHOUT
   // touching the page viewer or current source — the data and source viewers are
   // independent; only "Show full page" (openViewLink) crosses over.
@@ -618,7 +657,7 @@ export class ChronosPanel {
     let sourceDir = this.currentSourceDir;
     let sourceName = this.currentSourceName;
     if (sourcePath) {
-      sourceDir = isAbsolute(sourcePath) ? sourcePath : join(this.workspaceDir, sourcePath);
+      sourceDir = this.resolveCitedSource(sourcePath);
       sourceName = basename(sourceDir);
     }
     if (!sourceDir) return;
@@ -635,7 +674,7 @@ export class ChronosPanel {
     let sourceDir = this.currentSourceDir;
     let sourceName = this.currentSourceName;
     if (sourcePath) {
-      sourceDir = isAbsolute(sourcePath) ? sourcePath : join(this.workspaceDir, sourcePath);
+      sourceDir = this.resolveCitedSource(sourcePath);
       sourceName = basename(sourceDir);
     }
     if (!sourceDir || !sourceName) return;
@@ -667,25 +706,40 @@ export class ChronosPanel {
   }
 
   // ── dataset viewer ─────────────────────────────────────────────────────────
-  // The agent writes extraction outputs to data/<sourceName>/ (sourceName is the
-  // source dir basename, matching change_source / select-source). We surface
-  // those files in the Data tab; row provenance reuses openViewLink.
+  // The agent writes extraction outputs to data/<dataKey>/ and sends that dataKey
+  // as the viewer event's `sourceName` (basename for flat sources, a slug for
+  // nested ones), so data/<sourceName> here always matches the agent's output dir.
+  // We surface those files in the Data tab; row provenance reuses openViewLink.
 
   private dataDir(): string | undefined {
     return this.currentSourceName ? join(this.workspaceDir, "data", this.currentSourceName) : undefined;
   }
 
-  private listDataFiles(): string[] {
-    const dir = this.dataDir();
-    if (!dir) return [];
+  private filesIn(dir: string): string[] {
     try {
       return readdirSync(dir, { withFileTypes: true })
         .filter((e) => e.isFile() && !e.name.startsWith("."))
-        .map((e) => e.name)
-        .sort((a, b) => a.localeCompare(b));
+        .map((e) => e.name);
     } catch {
       return [];
     }
+  }
+
+  // The active source's files plus, when a collection is active, its
+  // collection-level files (entity index, cross-source summaries). Records each
+  // file's directory so data/load reads it back from the right place; the source
+  // dir wins on a name clash.
+  private listDataFiles(): string[] {
+    this.dataFileDirs.clear();
+    const collectionDir = this.activeCollectionDataDir;
+    if (collectionDir) {
+      for (const name of this.filesIn(collectionDir)) this.dataFileDirs.set(name, collectionDir);
+    }
+    const sourceDir = this.dataDir();
+    if (sourceDir) {
+      for (const name of this.filesIn(sourceDir)) this.dataFileDirs.set(name, sourceDir);
+    }
+    return [...this.dataFileDirs.keys()].sort((a, b) => a.localeCompare(b));
   }
 
   private postDataFiles(): void {
@@ -694,9 +748,10 @@ export class ChronosPanel {
   }
 
   private postDataFile(filename: string): void {
-    const dir = this.dataDir();
     // filenames come from listDataFiles (basenames); reject anything path-like.
-    if (!dir || filename.includes("/") || filename.includes("\\") || filename.includes("..")) return;
+    if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) return;
+    const dir = this.dataFileDirs.get(filename) ?? this.dataDir();
+    if (!dir) return;
     try {
       const content = readFileSync(join(dir, filename), "utf-8");
       this.post({ type: "data/show", sourceName: this.currentSourceName ?? "", filename, content });
@@ -743,6 +798,11 @@ export class ChronosPanel {
             // Re-arm the Data-tab refresh guard so re-selecting the same source
             // (or restoring it on resume) repopulates the (now-cleared) Data tab.
             this.lastDataSource = undefined;
+            // New session starts on the auto collection; the agent re-emits the
+            // active collection on its session_start, which corrects this if needed.
+            this.activeCollection = null;
+            this.activeCollectionDataDir = undefined;
+            this.postCollections();
             this.post({ type: "history", messages: [] });
             // The new session has no source bound — clear the viewer + dropdown so
             // the display matches (don't leave the previous source showing).
@@ -791,6 +851,13 @@ export class ChronosPanel {
           // (which arrives back here as an extension_ui_request).
           await this.rpc?.request({ type: "prompt", message: `/select-source ${msg.name}` }, 0);
           break;
+        case "selectCollection": {
+          // null → the auto "all sources" collection. "(all sources)" is the exact
+          // sentinel the pi-package's /select-collection maps back to null.
+          const arg = msg.name ?? "(all sources)";
+          await this.rpc?.request({ type: "prompt", message: `/select-collection ${arg}` }, 0);
+          break;
+        }
         case "refreshSessions":
           this.postSessions();
           break;

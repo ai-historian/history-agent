@@ -67,6 +67,9 @@ interface ExpertTurn {
   running: boolean;
   isError: boolean;
   toolUses?: ExpertToolUse[];
+  /** Workspace-relative source path so this turn's page/region chips open the
+   *  expert's own source, not whichever was shown last. */
+  source?: string;
 }
 
 const SOURCE_SELECTED_RE = /^Source selected: "([^"]+)"/;
@@ -87,7 +90,7 @@ function messageText(content: string | { type: string; [key: string]: any }[]): 
 
 // A view a chat entry can re-open in the viewer (the agent showed it earlier).
 type ViewRef =
-  | { kind: "page"; pageId: number; bbox: { x: number; y: number; w: number; h: number } | null }
+  | { kind: "page"; pageId: number; bbox: { x: number; y: number; w: number; h: number } | null; source?: string }
   | { kind: "text"; filePath: string; highlight: string | null };
 
 // Tool calls that drove the page viewer carry enough in their args to re-open
@@ -95,7 +98,8 @@ type ViewRef =
 function viewRefFromTool(item: ToolItem): ViewRef | null {
   const a: any = item.args ?? {};
   if (item.toolName === "show_page" && typeof a.page_id === "number") {
-    return { kind: "page", pageId: a.page_id, bbox: a.bbox ?? null };
+    const source = (item.result as any)?.details?.source;
+    return { kind: "page", pageId: a.page_id, bbox: a.bbox ?? null, source: typeof source === "string" ? source : undefined };
   }
   if (item.toolName === "show_text" && typeof a.file_path === "string") {
     return { kind: "text", filePath: a.file_path, highlight: a.highlight ?? null };
@@ -146,18 +150,22 @@ function taskReplyText(item: ToolItem): string {
 interface BatchExpertEntry {
   taskId?: string;
   page_id: number;
-  status: "ok" | "error";
+  /** queued/running only appear in live (partial) results while the batch runs. */
+  status: "queued" | "running" | "ok" | "error";
   response?: string;
   file?: string;
   error?: string;
   toolUses?: ExpertToolUse[];
+  /** Live activity line for a running expert (e.g. "view_region · 3 tool calls"). */
+  activity?: string;
 }
 
-/** Read a task_batch tool result's details (empty until the call completes). */
+/** Read a task_batch tool result's details (streamed live while it runs). */
 function batchDetails(item: ToolItem): {
   model?: string;
   prompt: string;
   bbox?: { x: number; y: number; w: number; h: number };
+  source?: string;
   experts: BatchExpertEntry[];
 } {
   const d = (item.result as any)?.details ?? {};
@@ -165,6 +173,7 @@ function batchDetails(item: ToolItem): {
     model: d.model,
     prompt: typeof d.prompt === "string" ? d.prompt : "",
     bbox: d.bbox ?? undefined,
+    source: typeof d.source === "string" ? d.source : undefined,
     experts: Array.isArray(d.experts) ? d.experts : [],
   };
 }
@@ -883,9 +892,10 @@ export class ChronosChat extends LitElement {
           running: !!item.running,
           isError: !!item.isError,
           toolUses: (item.result as any)?.details?.toolUses,
+          source: (item.result as any)?.details?.source,
         });
       } else if (item.toolName === "task_batch") {
-        const { prompt, bbox, experts } = batchDetails(item);
+        const { prompt, bbox, source, experts } = batchDetails(item);
         const entry = experts.find((e) => e.taskId === taskId);
         if (entry) {
           turns.push({
@@ -893,9 +903,10 @@ export class ChronosChat extends LitElement {
             pageId: entry.page_id,
             bbox,
             reply: entry.response ?? (entry.file ? `→ ${entry.file}` : entry.error ?? ""),
-            running: false,
+            running: entry.status === "queued" || entry.status === "running",
             isError: entry.status === "error",
             toolUses: entry.toolUses,
+            source,
           });
         }
       }
@@ -923,6 +934,9 @@ export class ChronosChat extends LitElement {
     const isFollowUp = item.args?.task_id != null;
     const prompt = String(item.args?.prompt ?? "");
     const pageId = item.args?.page_id;
+    // Workspace-relative source (from the result) so the page chip opens this
+    // expert's source, not the last-shown one.
+    const source = (item.result as any)?.details?.source as string | undefined;
 
     // A finished call without a task_id is a refused/failed spawn (bad model,
     // unknown task_id, …) — fall back to the plain tool card so the error is
@@ -937,10 +951,19 @@ export class ChronosChat extends LitElement {
         ? html`✗`
         : html`✓`;
     const turnCount = taskId ? this.expertTurns(taskId).length : 0;
+    // Live activity streamed via tool_execution_update while the expert works.
+    const live = (item.result as any)?.details?.live as
+      | { phase: string; toolCalls: number; lastTool?: string }
+      | undefined;
+    const liveStatus = live
+      ? live.phase === "tool"
+        ? `${live.lastTool} · ${live.toolCalls} tool ${live.toolCalls === 1 ? "call" : "calls"}`
+        : live.toolCalls > 0
+          ? `thinking · ${live.toolCalls} tool ${live.toolCalls === 1 ? "call" : "calls"}`
+          : "thinking…"
+      : undefined;
     const status = item.running
-      ? isFollowUp
-        ? "answering…"
-        : "consulting…"
+      ? (liveStatus ?? (isFollowUp ? "answering…" : "consulting…"))
       : `${turnCount} ${turnCount === 1 ? "turn" : "turns"}`;
 
     return html`
@@ -970,7 +993,7 @@ export class ChronosChat extends LitElement {
                   @click=${(e: MouseEvent) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    this.postMessage({ type: "openViewLink", pageId, bbox: item.args?.bbox ?? null });
+                    this.postMessage({ type: "openViewLink", pageId, bbox: item.args?.bbox ?? null, sourcePath: source });
                   }}
                   >p. ${pageId}</a
                 >`
@@ -1017,17 +1040,18 @@ export class ChronosChat extends LitElement {
     const reply = turn.reply.replace(LEADING_VIEW_LINKS_RE, "");
     const bbox = turn.bbox;
     const bboxAttr = bbox ? `${bbox.x},${bbox.y},${bbox.w},${bbox.h}` : undefined;
+    const srcAttr = turn.source ? encodeURIComponent(turn.source) : nothing;
     return html`
       <div class="expert-turn-q">
         ${turn.pageId != null
-          ? html`<a class="view-link ${bboxAttr ? "view-link-has-sel" : ""}" href="#" data-page=${turn.pageId} data-bbox=${bboxAttr ?? nothing}>p. ${turn.pageId}</a>`
+          ? html`<a class="view-link ${bboxAttr ? "view-link-has-sel" : ""}" href="#" data-page=${turn.pageId} data-bbox=${bboxAttr ?? nothing} data-src=${srcAttr}>p. ${turn.pageId}</a>`
           : nothing}
         <span>${turn.prompt}</span>
       </div>
       ${turn.toolUses && turn.toolUses.length
         ? html`<div class="expert-turn-tools">
             <span class="expert-turn-tools-label">examined</span>
-            ${turn.toolUses.map((u) => this.renderExpertToolUse(u))}
+            ${turn.toolUses.map((u) => this.renderExpertToolUse(u, turn.source))}
           </div>`
         : nothing}
       ${turn.running
@@ -1040,7 +1064,7 @@ export class ChronosChat extends LitElement {
   // clickable viewer links so the historian can jump to exactly what the expert
   // pulled in; file/search/command tools show as a labelled chip with the
   // command/path/term. Elevated tools (bash/write/edit) are visually flagged.
-  private renderExpertToolUse(u: ExpertToolUse): TemplateResult {
+  private renderExpertToolUse(u: ExpertToolUse, source?: string): TemplateResult {
     if (u.pageId != null && (u.tool === "view_region" || u.tool === "view_page")) {
       const label = u.tool === "view_region" ? "⛶ region" : "page";
       const bboxAttr = u.bbox ? `${u.bbox.x},${u.bbox.y},${u.bbox.w},${u.bbox.h}` : undefined;
@@ -1050,6 +1074,7 @@ export class ChronosChat extends LitElement {
         title=${u.isError ? "This lookup failed" : `Jump to p.${u.pageId}`}
         data-page=${u.pageId}
         data-bbox=${bboxAttr ?? nothing}
+        data-src=${source ? encodeURIComponent(source) : nothing}
         >${label} p.${u.pageId}</a
       >`;
     }
@@ -1072,34 +1097,45 @@ export class ChronosChat extends LitElement {
   }
 
   private renderExpertBatchCard(item: ToolItem): TemplateResult {
-    if (item.running) {
-      return html`
-        <div class="expert-batch-card is-running">
-          <div class="expert-batch-head">
-            <span class="expert-seal" aria-hidden="true"><span class="spinner"></span></span>
-            <span class="expert-title">Expert cohort</span>
-            <span class="expert-spacer"></span>
-            <span class="expert-status">spawning experts…</span>
-          </div>
-        </div>
-      `;
-    }
     const { model, experts } = batchDetails(item);
-    // A batch that errored before spawning anything (no source, bad template,
-    // empty page list) carries no experts — fall back to the plain tool card.
-    if (experts.length === 0) return this.renderTool(item);
+    if (experts.length === 0) {
+      // Running but no progress event yet (spawn/confirmation phase) — show a
+      // pulse so it's clear Chronos hasn't frozen.
+      if (item.running) {
+        return html`
+          <div class="expert-batch-card is-running">
+            <div class="expert-batch-head">
+              <span class="expert-seal" aria-hidden="true"><span class="spinner"></span></span>
+              <span class="expert-title">Expert cohort</span>
+              <span class="expert-spacer"></span>
+              <span class="expert-status">spawning experts…</span>
+            </div>
+          </div>
+        `;
+      }
+      // A batch that errored before spawning anything (no source, bad template,
+      // empty page list) carries no experts — fall back to the plain tool card.
+      return this.renderTool(item);
+    }
 
+    const queued = experts.filter((e) => e.status === "queued").length;
+    const running = experts.filter((e) => e.status === "running").length;
     const ok = experts.filter((e) => e.status === "ok").length;
-    const err = experts.length - ok;
+    const err = experts.filter((e) => e.status === "error").length;
+    // While running, the model may still be the "(orchestrator default)"
+    // placeholder — hide it until a real id is known.
+    const shownModel = model && model !== "(orchestrator default)" ? model : undefined;
     return html`
-      <details class="expert-batch-card" open>
+      <details class="expert-batch-card ${item.running ? "is-running" : ""}" open>
         <summary>
-          <span class="expert-seal" aria-hidden="true">✦</span>
+          <span class="expert-seal" aria-hidden="true">${item.running ? html`<span class="spinner"></span>` : "✦"}</span>
           <span class="group-chevron"></span>
           <span class="expert-title">Expert cohort</span>
           <span class="expert-batch-count">${experts.length} pages</span>
-          ${model ? html`<span class="expert-model">${model}</span>` : nothing}
+          ${shownModel ? html`<span class="expert-model">${shownModel}</span>` : nothing}
           <span class="expert-spacer"></span>
+          ${item.running ? html`<span class="expert-batch-running">${running} running</span>` : nothing}
+          ${item.running && queued > 0 ? html`<span class="expert-batch-queued">${queued} queued</span>` : nothing}
           <span class="expert-batch-ok">✓ ${ok}</span>
           ${err > 0 ? html`<span class="expert-batch-err">✗ ${err}</span>` : nothing}
         </summary>
@@ -1111,19 +1147,30 @@ export class ChronosChat extends LitElement {
   }
 
   private renderBatchChip(e: BatchExpertEntry): TemplateResult {
-    const ok = e.status === "ok";
+    const finished = e.status === "ok" || e.status === "error";
+    const clickable = finished && !!e.taskId;
     const idx = e.taskId ? e.taskId.replace(/^task-/, "#") : "—";
+    const foot =
+      e.status === "queued" ? "queued" : e.status === "running" ? (e.activity ?? "working…") : idx;
+    const title =
+      e.status === "error"
+        ? (e.error ?? "failed")
+        : e.status === "queued"
+          ? "Waiting for a free worker slot"
+          : e.status === "running"
+            ? (e.activity ?? "working…")
+            : `View ${e.taskId} transcript`;
     return html`
       <button
-        class="expert-chip ${ok ? "" : "is-error"}"
-        ?disabled=${!e.taskId}
-        title=${ok ? `View ${e.taskId} transcript` : e.error ?? "failed"}
-        @click=${() => e.taskId && (this.openExpert = e.taskId)}
+        class="expert-chip is-${e.status}"
+        ?disabled=${!clickable}
+        title=${title}
+        @click=${() => clickable && (this.openExpert = e.taskId!)}
       >
         <span class="expert-chip-page">p. ${e.page_id}</span>
         <span class="expert-chip-foot">
-          <span class="expert-chip-task">${idx}</span>
-          <span class="expert-chip-dot ${ok ? "" : "is-error"}" aria-hidden="true"></span>
+          <span class="expert-chip-task">${foot}</span>
+          <span class="expert-chip-dot is-${e.status}" aria-hidden="true"></span>
         </span>
       </button>
     `;
@@ -1209,7 +1256,7 @@ export class ChronosChat extends LitElement {
         e.preventDefault();
         e.stopPropagation();
         if (ref.kind === "page") {
-          this.postMessage({ type: "openViewLink", pageId: ref.pageId, bbox: ref.bbox });
+          this.postMessage({ type: "openViewLink", pageId: ref.pageId, bbox: ref.bbox, sourcePath: ref.source });
         } else {
           this.postMessage({ type: "openTextView", filePath: ref.filePath, highlight: ref.highlight });
         }

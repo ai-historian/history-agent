@@ -8,7 +8,7 @@ export interface SourceInfo {
 }
 
 /** Convert a relative path to a URL-safe slug. */
-function toSlug(rel: string): string {
+export function toSlug(rel: string): string {
   return rel.replace(/[\\/]/g, "--").replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 

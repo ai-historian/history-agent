@@ -122,6 +122,12 @@ export interface ExpertTurnInput {
    * text as the file's contents. Undefined for inline (return-text) tasks.
    */
   outputPath?: string;
+  /**
+   * Called as the turn progresses (each completion round-trip and tool call) so
+   * callers can surface live status. Must not throw; failures here must never
+   * fail the turn.
+   */
+  onProgress?: (progress: ExpertProgress) => void;
 }
 
 /** One tool the expert invoked during a turn — surfaced to the UI for oversight. */
@@ -132,6 +138,20 @@ export interface ExpertToolUse {
   /** Short label for non-page tools (command run, file path, search term). */
   detail?: string;
   isError: boolean;
+}
+
+/** Live snapshot of a running expert turn, streamed to the caller's onProgress. */
+export interface ExpertProgress {
+  /** "thinking" while a completion is in flight; "tool" right after a tool ran. */
+  phase: "thinking" | "tool";
+  /** Total tool calls made so far this turn. */
+  toolCalls: number;
+  /** Name of the most recent tool (set in phase "tool"). */
+  lastTool?: string;
+  /** Task id, once assigned (before the first completion). */
+  taskId?: string;
+  /** Tools invoked so far this turn, in order — lets the UI trace work live. */
+  toolUses: ExpertToolUse[];
 }
 
 export type ExpertTurnResult =
@@ -152,6 +172,19 @@ export type ExpertTurnResult =
 
 function isToolCall(c: { type: string }): c is ToolCall {
   return c.type === "toolCall";
+}
+
+/** Map persisted intermediate steps to the UI-facing tool-use trace. */
+function stepsToToolUses(steps: PersistedStep[]): ExpertToolUse[] {
+  return steps
+    .filter((s): s is Extract<PersistedStep, { kind: "toolResult" }> => s.kind === "toolResult")
+    .map((s) => ({
+      tool: s.toolResult.toolName,
+      pageId: s.toolResult.image?.pageId,
+      bbox: s.toolResult.image?.bbox,
+      detail: s.toolResult.detail,
+      isError: s.toolResult.isError,
+    }));
 }
 
 /**
@@ -268,10 +301,22 @@ export async function runExpertTurn(
   let wroteOutput = false;
   let finalResponse;
 
+  // Live progress for the caller's UI. Best-effort: a listener bug must never
+  // fail the expert's actual work.
+  const emitProgress = (phase: ExpertProgress["phase"], lastTool?: string): void => {
+    if (!input.onProgress) return;
+    try {
+      input.onProgress({ phase, toolCalls: toolCallCount, lastTool, taskId, toolUses: stepsToToolUses(steps) });
+    } catch {
+      // ignore
+    }
+  };
+
   for (;;) {
     if (input.signal?.aborted) {
       return { ok: false, taskId, error: "Expert turn aborted." };
     }
+    emitProgress("thinking");
     const { response, attempts } = await completeWithRetry(
       () =>
         complete(
@@ -328,6 +373,7 @@ export async function runExpertTurn(
       steps.push({ kind: "toolResult", toolResult: outcome.persist });
       if (outcome.viewedPageId !== undefined) currentPageId = outcome.viewedPageId;
       if (outcome.wroteOutput) wroteOutput = true;
+      emitProgress("tool", call.name);
     }
     // Spent the budget — stop the exploratory tools so the next completion must
     // answer. When an output_file is still owed, keep ONLY save_output (within a
@@ -364,15 +410,7 @@ export async function runExpertTurn(
   });
 
   // Surface the expert's tool calls (page/region it pulled in) for UI oversight.
-  const toolUses: ExpertToolUse[] = steps
-    .filter((s): s is Extract<PersistedStep, { kind: "toolResult" }> => s.kind === "toolResult")
-    .map((s) => ({
-      tool: s.toolResult.toolName,
-      pageId: s.toolResult.image?.pageId,
-      bbox: s.toolResult.image?.bbox,
-      detail: s.toolResult.detail,
-      isError: s.toolResult.isError,
-    }));
+  const toolUses: ExpertToolUse[] = stepsToToolUses(steps);
 
   return {
     ok: true,

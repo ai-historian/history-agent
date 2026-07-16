@@ -1,10 +1,9 @@
-import { writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExpertRegistry } from "./expert-registry.js";
-import type { SourceContext } from "./source-context.js";
-import { requireSourceDataDir } from "./source-context.js";
+import type { CollectionContext } from "./collection-context.js";
+import { requireSourceDataDir, resolveSource } from "./collection-context.js";
 import { runExpertTurn, confirmExpertGrant } from "./expert-turn.js";
 import type { ExpertCapability } from "./expert-tools.js";
 
@@ -19,6 +18,11 @@ const grantParam = Type.Optional(
 );
 
 const taskParams = Type.Object({
+  source: Type.String({
+    description:
+      "Collection member ref the expert works on (see the catalog in the system prompt). " +
+      "Required — the expert's page image and its view_page/view_region tools are scoped to this source.",
+  }),
   prompt: Type.String({ description: "What to ask the expert model." }),
   task_id: Type.Optional(
     Type.String({
@@ -45,8 +49,10 @@ const taskParams = Type.Object({
   output_file: Type.Optional(
     Type.String({
       description:
-        "If provided, write the model response to this file in the source directory " +
-        "(e.g. 'entries_0042.json'). The tool returns a short confirmation instead of the full text.",
+        "If provided, the expert writes its result to this file in the source data directory " +
+        "(e.g. 'entries_0042.json') itself, via a scoped save_output tool (JSON is validated before " +
+        "writing) — its chat text is not captured. The tool returns a short confirmation; if the " +
+        "expert never calls save_output, no file is written and that is reported.",
     })
   ),
   bbox: Type.Optional(
@@ -64,7 +70,7 @@ const taskParams = Type.Object({
 });
 
 export function createTaskTool(
-  sourceCtx: SourceContext,
+  collectionCtx: CollectionContext,
   registry: ExpertRegistry,
   description: string,
   pageExpertPrompt: string,
@@ -74,7 +80,7 @@ export function createTaskTool(
     label: "Task",
     description,
     parameters: taskParams,
-    async execute(_toolCallId, params, signal, _onUpdate, extCtx) {
+    async execute(_toolCallId, params, signal, onUpdate, extCtx) {
       const grant: ExpertCapability[] = params.grant ?? [];
       if (grant.length > 0 && !(await confirmExpertGrant(extCtx, grant, "this expert"))) {
         return {
@@ -89,7 +95,20 @@ export function createTaskTool(
           details: {},
         };
       }
-      const result = await runExpertTurn(registry, sourceCtx, pageExpertPrompt, extCtx, {
+      // Pre-resolve the output path the expert will write to via save_output. If
+      // the source ref is bad, runExpertTurn returns the proper error below, so
+      // just leave outputPath undefined here.
+      let outputPath: string | undefined;
+      if (params.output_file) {
+        try {
+          outputPath = join(requireSourceDataDir(collectionCtx, params.source), params.output_file);
+        } catch {
+          outputPath = undefined;
+        }
+      }
+
+      const result = await runExpertTurn(registry, collectionCtx, pageExpertPrompt, extCtx, {
+        source: params.source,
         taskId: params.task_id,
         prompt: params.prompt,
         model: params.model,
@@ -97,6 +116,28 @@ export function createTaskTool(
         bbox: params.bbox,
         signal,
         grantedCaps: grant,
+        outputPath,
+        // Stream the expert's live state (phase + tool trace) so the UI card can
+        // show what it is doing instead of a bare spinner.
+        onProgress: onUpdate
+          ? (p) =>
+              onUpdate({
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      p.phase === "tool"
+                        ? `Expert working… ${p.toolCalls} tool ${p.toolCalls === 1 ? "call" : "calls"} (last: ${p.lastTool})`
+                        : "Expert thinking…",
+                  },
+                ],
+                details: {
+                  taskId: p.taskId,
+                  toolUses: p.toolUses,
+                  live: { phase: p.phase, toolCalls: p.toolCalls, lastTool: p.lastTool },
+                },
+              })
+          : undefined,
       });
 
       if (!result.ok) {
@@ -111,28 +152,48 @@ export function createTaskTool(
       const bbox = params.bbox ?? null;
       const costStr = cost !== undefined ? ` [cost: $${cost.toFixed(4)}]` : "";
 
+      // Workspace-relative source path — used both to source-qualify the citation
+      // (@path) and passed in details.source so the expert transcript's page/region
+      // chips open this task's source, not whichever was shown last. The turn
+      // succeeded, so params.source resolves; guard anyway.
+      let sourceRel = "";
+      try {
+        sourceRel = relative(collectionCtx.workspaceDir, resolveSource(collectionCtx, params.source).path);
+      } catch {
+        sourceRel = "";
+      }
+      const src = sourceRel ? `@${sourceRel}` : "";
       const viewLink =
         pageId === null
           ? ""
           : bbox
-            ? `[view p.${pageId}] [view p.${pageId}#sel=${bbox.x},${bbox.y},${bbox.w},${bbox.h}]\n`
-            : `[view p.${pageId}]\n`;
+            ? `[view p.${pageId}${src}] [view p.${pageId}#sel=${bbox.x},${bbox.y},${bbox.w},${bbox.h}${src}]\n`
+            : `[view p.${pageId}${src}]\n`;
       const trailer = `\ntask_id: ${taskId}`;
 
       if (params.output_file) {
-        const dataDir = requireSourceDataDir(sourceCtx);
-        mkdirSync(dataDir, { recursive: true });
-        const outPath = join(dataDir, params.output_file);
-        writeFileSync(outPath, text || "(empty response)", "utf-8");
+        // The expert writes the file itself via save_output; report from whether it did.
+        const body = result.wroteOutput
+          ? `${viewLink}→ ${params.output_file}${trailer}`
+          : `${viewLink}(expert produced no output — save_output was never called, so no file was written)${trailer}`;
         return {
-          content: [{ type: "text", text: `${viewLink}→ ${params.output_file}${trailer}` }],
-          details: { model, taskId, pageId, bbox, cost: costStr, path: outPath, toolUses },
+          content: [{ type: "text", text: body }],
+          details: {
+            model,
+            taskId,
+            pageId,
+            bbox,
+            cost: costStr,
+            path: result.wroteOutput ? outputPath : undefined,
+            toolUses,
+            source: sourceRel || undefined,
+          },
         };
       }
 
       return {
         content: [{ type: "text", text: `${viewLink}${text || "(empty response)"}${trailer}` }],
-        details: { model, taskId, pageId, bbox, cost: costStr, toolUses },
+        details: { model, taskId, pageId, bbox, cost: costStr, toolUses, source: sourceRel || undefined },
       };
     },
   };

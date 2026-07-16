@@ -49,6 +49,12 @@ export type ExtToWebview =
   | { type: "yolo"; enabled: boolean }
   // workspace data
   | { type: "sources"; sources: { name: string; pageCount: number }[] }
+  | {
+      type: "collections";
+      collections: { name: string; description?: string; memberCount: number }[];
+      // Active collection name; null = the auto "all sources" collection.
+      active: string | null;
+    }
   | { type: "sessions"; sessions: ChronosSessionInfo[] }
   | { type: "resumeResult"; ok: boolean }
   // auth: no models are available until the user connects a provider
@@ -94,6 +100,8 @@ export type WebviewToExt =
   | { type: "setModel"; provider: string; modelId: string }
   | { type: "setThinkingLevel"; level: ThinkingLevel }
   | { type: "selectSource"; name: string }
+  // pick the active collection; name null = the auto "all sources" collection
+  | { type: "selectCollection"; name: string | null }
   | { type: "refreshSessions" }
   | { type: "refreshSources" }
   | { type: "uiResponse"; response: RpcExtensionUIResponse }

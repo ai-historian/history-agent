@@ -3,10 +3,13 @@ import { resolve, isAbsolute, join, basename } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { sendToExtension } from "../http/http-client.js";
-import type { SourceContext } from "./source-context.js";
-import { requireSource } from "./source-context.js";
+import type { CollectionContext } from "./collection-context.js";
+import { resolveSource } from "./collection-context.js";
 
 const showTextParams = Type.Object({
+  source: Type.String({
+    description: "Collection member ref the file belongs to (used to resolve a relative file_path).",
+  }),
   file_path: Type.String({
     description: "Path to the text file. Absolute, or relative to the source directory.",
   }),
@@ -18,14 +21,15 @@ const showTextParams = Type.Object({
   ),
 });
 
-export function createShowTextTool(ctx: SourceContext, description: string): ToolDefinition<typeof showTextParams> {
+export function createShowTextTool(ctx: CollectionContext, description: string): ToolDefinition<typeof showTextParams> {
   return {
     name: "show_text",
     label: "Show Text",
     description,
     parameters: showTextParams,
     async execute(_toolCallId, params) {
-      const sourceDir = requireSource(ctx);
+      const m = resolveSource(ctx, params.source);
+      const sourceDir = m.path;
       const filePath = isAbsolute(params.file_path)
         ? params.file_path
         : resolve(join(sourceDir, params.file_path));
@@ -46,7 +50,7 @@ export function createShowTextTool(ctx: SourceContext, description: string): Too
         filePath,
         content,
         highlight: params.highlight ?? null,
-        sourceName: ctx.sourceName ?? basename(filePath),
+        sourceName: basename(m.dataDir),
       });
 
       return {
