@@ -171,9 +171,14 @@ const ELEVATED_TOOL_NAMES: Record<string, ExpertCapability> = {
  * image tools only when the model can consume images, and the elevated tools
  * only for capabilities the orchestrator granted (and the user approved).
  */
-export function buildExpertTools(opts: { vision: boolean; granted: ExpertCapability[]; output: boolean }): Tool[] {
+export function buildExpertTools(opts: {
+  vision: boolean;
+  hasSource: boolean;
+  granted: ExpertCapability[];
+  output: boolean;
+}): Tool[] {
   const tools: Tool[] = [];
-  if (opts.vision) tools.push(VIEW_REGION_TOOL, VIEW_PAGE_TOOL);
+  if (opts.vision && opts.hasSource) tools.push(VIEW_REGION_TOOL, VIEW_PAGE_TOOL);
   tools.push(READ_FILE_TOOL, LIST_DIR_TOOL, GREP_TOOL);
   for (const cap of opts.granted) {
     const tool = ELEVATED_TOOLS[cap];
@@ -181,6 +186,22 @@ export function buildExpertTools(opts: { vision: boolean; granted: ExpertCapabil
   }
   if (opts.output) tools.push(SAVE_OUTPUT_TOOL);
   return tools;
+}
+
+/**
+ * Resolve an `image` path for a task/task_batch call. Like resolveInWorkspace it
+ * keeps the target inside the workspace, but deliberately does NOT apply the
+ * restricted-dir filter: page images legitimately live under png/, and the
+ * anti-secret-leak rationale doesn't apply here because the target must decode
+ * as an image (a .env won't). workspaceRoot is the pi cwd / workspace dir.
+ */
+export function resolveImagePath(workspaceRoot: string, p: string): string {
+  const abs = resolve(workspaceRoot, p);
+  const rel = relative(workspaceRoot, abs);
+  if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) {
+    throw new Error("Image path is outside the workspace.");
+  }
+  return abs;
 }
 
 export interface ExpertToolImageRef {

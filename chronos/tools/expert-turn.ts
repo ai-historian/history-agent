@@ -14,7 +14,7 @@ import { newTaskId } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
 import { resolveSource } from "./collection-context.js";
 import { resolveExpertModel } from "../utils/resolve-model.js";
-import { cropImageToBuffer, downscaleToLimit, type Bbox } from "../utils/crop-image.js";
+import { cropImageToBuffer, downscaleToLimit, loadImageAsPng, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
 import { envInt } from "../utils/env-config.js";
 import { completeWithRetry } from "../utils/expert-retry.js";
@@ -96,17 +96,31 @@ export async function pageImageContent(sourceDir: string, pageId: number, bbox?:
   return { type: "image", data: capped.toString("base64"), mimeType: "image/png" };
 }
 
+/**
+ * Build the image content block for an arbitrary image file (not a source page),
+ * normalized to a downscaled PNG. Mirrors `pageImageContent`; shared by live
+ * turns and session restore so an image task rehydrates from disk.
+ */
+export async function imageFileContent(imgPath: string): Promise<ImageContent> {
+  const png = await loadImageAsPng(imgPath, MAX_IMAGE_DIMENSION);
+  return { type: "image", data: png.toString("base64"), mimeType: "image/png" };
+}
+
 export interface ExpertTurnInput {
-  /** Collection member ref the expert works on. Always provided (the tools require it). */
-  source: string;
+  /** Collection member ref the expert works on. Optional now — omit for a
+   *  sourceless task (no source-scoped view/save tools). */
+  source?: string;
   /** Continue an existing session; omit to spawn a new one. */
   taskId?: string;
   prompt: string;
   /** provider/model-id; defaults to the session's model on follow-up, else the orchestrator's current model. */
   model?: string;
-  /** Attach this page's image to the message. */
+  /** Attach this source page's image. Requires `source`. */
   pageId?: number;
   bbox?: Bbox;
+  /** Attach an arbitrary image by absolute path (pre-resolved by the caller).
+   *  Mutually exclusive with pageId. */
+  imagePath?: string;
   /** Abort the (multi-call) agentic loop when the user cancels. */
   signal?: AbortSignal;
   /**
@@ -204,14 +218,19 @@ export async function runExpertTurn(
   if (input.bbox && input.pageId === undefined) {
     return { ok: false, error: "bbox requires page_id." };
   }
+  if (input.pageId !== undefined && !input.source) {
+    return { ok: false, error: "page_id requires a source." };
+  }
 
-  // Resolve the source up-front — it scopes both the attached page image and the
-  // expert's own view_page/view_region tools. A source is always given now.
-  let sourceDir: string;
-  try {
-    sourceDir = resolveSource(collectionCtx, input.source).path;
-  } catch (e) {
-    return { ok: false, taskId: input.taskId, error: (e as Error).message };
+  // Resolve the source up-front only when one is given. It scopes the attached
+  // page image and the expert's own view_page/view_region tools.
+  let sourceDir: string | undefined;
+  if (input.source) {
+    try {
+      sourceDir = resolveSource(collectionCtx, input.source).path;
+    } catch (e) {
+      return { ok: false, taskId: input.taskId, error: (e as Error).message };
+    }
   }
 
   // Resolve the session first so a follow-up can default to its model.
@@ -232,8 +251,13 @@ export async function runExpertTurn(
   // The expert's tools always reach the resolved source, image or not.
   const content: (TextContent | ImageContent)[] = [];
   let pageId: number | null = null;
-  const turnSourceDir: string = sourceDir;
-  if (input.pageId !== undefined) {
+  if (input.imagePath) {
+    try {
+      content.push(await imageFileContent(input.imagePath));
+    } catch (e) {
+      return { ok: false, taskId, error: (e as Error).message };
+    }
+  } else if (input.pageId !== undefined && sourceDir) {
     pageId = Math.round(input.pageId);
     try {
       content.push(await pageImageContent(sourceDir, pageId, input.bbox));
@@ -263,7 +287,7 @@ export async function runExpertTurn(
     : extCtx.model
       ? modelSpec(extCtx.model)
       : undefined;
-  const resolved = await resolveExpertModel(input.model, extCtx.modelRegistry, fallback, pageId !== null);
+  const resolved = await resolveExpertModel(input.model, extCtx.modelRegistry, fallback, pageId !== null || !!input.imagePath);
   if (!resolved.ok) {
     return { ok: false, taskId, error: resolved.error };
   }
@@ -293,6 +317,7 @@ export async function runExpertTurn(
   const outputMode = !!input.outputPath;
   let expertToolDefs = buildExpertTools({
     vision: resolved.model.input.includes("image"),
+    hasSource: !!sourceDir,
     granted: [...granted],
     output: outputMode,
   });
@@ -363,7 +388,7 @@ export async function runExpertTurn(
     for (const call of toolCalls) {
       toolCallCount++;
       const outcome = await executeExpertTool(call, {
-        sourceDir: turnSourceDir,
+        sourceDir,
         currentPageId,
         cwd: extCtx.cwd,
         granted,
@@ -404,7 +429,8 @@ export async function runExpertTurn(
     prompt: input.prompt,
     pageId: pageId ?? undefined,
     bbox: input.bbox,
-    sourceDir: turnSourceDir,
+    imagePath: input.imagePath,
+    sourceDir,
     steps: steps.length > 0 ? steps : undefined,
     response: finalResponse,
   });
@@ -440,7 +466,13 @@ export async function restoreExpertSessions(
     const messages: Message[] = [];
     for (const turn of rec.turns) {
       const content: (TextContent | ImageContent)[] = [];
-      if (turn.pageId !== undefined && turn.sourceDir) {
+      if (turn.imagePath) {
+        try {
+          content.push(await imageFileContent(turn.imagePath));
+        } catch {
+          // image file no longer on disk — restore this turn text-only
+        }
+      } else if (turn.pageId !== undefined && turn.sourceDir) {
         try {
           content.push(await pageImageContent(turn.sourceDir, turn.pageId, turn.bbox));
         } catch {
