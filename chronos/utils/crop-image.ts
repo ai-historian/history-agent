@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import sharp from "sharp";
 
 export interface Bbox {
@@ -60,4 +61,19 @@ export async function downscaleToLimit(png: Buffer, maxDim: number): Promise<Buf
     .resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true })
     .png()
     .toBuffer();
+}
+
+/**
+ * Load an arbitrary image file and return it as a PNG buffer whose long edge is
+ * at most `maxDim` px (0 = no cap). Always re-encodes to PNG, so any
+ * sharp-readable format is accepted. Throws a clear error for a missing file;
+ * sharp's own error propagates for an undecodable one.
+ */
+export async function loadImageAsPng(imgPath: string, maxDim: number): Promise<Buffer> {
+  if (!existsSync(imgPath)) throw new Error(`Image not found: ${imgPath}`);
+  let img = sharp(readFileSync(imgPath));
+  if (maxDim > 0) {
+    img = img.resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true });
+  }
+  return img.png().toBuffer();
 }
