@@ -6,13 +6,15 @@ import type { CollectionContext } from "./collection-context.js";
 import { resolveSource } from "./collection-context.js";
 import type { ToolText } from "../utils/tool-loader.js";
 import { runExpertTurn, confirmExpertGrant, type ExpertTurnInput, type ExpertToolUse } from "./expert-turn.js";
-import type { ExpertCapability } from "./expert-tools.js";
+import { resolveImagePath, type ExpertCapability } from "./expert-tools.js";
 import { type Bbox } from "../utils/crop-image.js";
 import { envInt } from "../utils/env-config.js";
 
 interface ExpertEntry {
+  key: string;
+  label: string;
   taskId?: string;
-  page_id: number;
+  page_id?: number;
   status: "ok" | "error";
   response?: string;
   file?: string;
@@ -39,16 +41,27 @@ interface LiveExpertEntry extends Omit<ExpertEntry, "status"> {
 const PROGRESS_EMIT_MS = 150;
 
 const taskBatchParams = Type.Object({
-  source: Type.String({
-    description:
-      "Collection member ref every expert in this batch works on (see the catalog in the system prompt). " +
-      "One batch targets a single source; iterate sources with separate batches.",
-  }),
-  page_ids: Type.Array(Type.Number(), {
-    description:
-      "Array of page IDs to spawn an expert for (e.g. [42, 43, 44]). " +
-      "These are file-system indices, not printed page numbers.",
-  }),
+  source: Type.Optional(
+    Type.String({
+      description:
+        "Collection member ref every expert in this batch works on. Required when using page_ids; " +
+        "optional (and unused) when using images.",
+    }),
+  ),
+  page_ids: Type.Optional(
+    Type.Array(Type.Number(), {
+      description:
+        "Spawn one expert per page id (file-system indices, not printed page numbers). Requires `source`. " +
+        "Provide EITHER page_ids OR images, not both.",
+    }),
+  ),
+  images: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Spawn one expert per arbitrary image file path (workspace-relative). Source-independent. " +
+        "Provide EITHER page_ids OR images, not both.",
+    }),
+  ),
   prompt: Type.String({ description: "The prompt sent to each page's expert." }),
   model: Type.Optional(
     Type.String({
@@ -61,12 +74,10 @@ const taskBatchParams = Type.Object({
   output_file: Type.Optional(
     Type.String({
       description:
-        "File name template with a {page_id} placeholder (e.g. 'entries_{page_id}.json'). " +
-        "{page_id} is replaced with the zero-padded page number (e.g. 0042), giving each page its " +
-        "own file in the source data directory. When set, each expert writes its result there itself " +
-        "via a scoped save_output tool (JSON is validated before writing) — its chat text is not " +
-        "captured. A page whose expert never calls save_output is reported as producing no output. " +
-        "If omitted, results are returned inline.",
+        "Filename template. For a page batch use {page_id} (zero-padded), written in the source data dir. " +
+        "For an image batch use {index} (1-based, zero-padded) and/or {name} (image basename without " +
+        "extension), written workspace-relative. Each expert writes its own result via save_output (JSON " +
+        "validated). If omitted, results are returned inline.",
     }),
   ),
   concurrency: Type.Optional(
@@ -113,27 +124,68 @@ export function createTaskBatchTool(
     promptGuidelines: toolText.promptGuidelines,
     parameters: taskBatchParams,
     async execute(_toolCallId, params, signal, onUpdate, extCtx) {
-      const member = resolveSource(collectionCtx, params.source);
-      const outputDir = member.dataDir;
-      const sourceRel = relative(collectionCtx.workspaceDir, member.path);
-      const pageIds = params.page_ids.map((id) => Math.round(id));
-      const outputFileTemplate = params.output_file;
-      const bbox = params.bbox as Bbox | undefined;
+      interface BatchItem { key: string; label: string; sortIndex: number; pageId?: number; imagePath?: string; }
 
-      if (outputFileTemplate && !outputFileTemplate.includes("{page_id}")) {
+      const usePages = Array.isArray(params.page_ids) && params.page_ids.length > 0;
+      const useImages = Array.isArray(params.images) && params.images.length > 0;
+      if (usePages === useImages) {
         return {
-          content: [{ type: "text", text: "output_file must contain {page_id} placeholder (e.g. 'entries_{page_id}.json')." }],
+          content: [{ type: "text", text: "Provide exactly one of `page_ids` or `images` (non-empty)." }],
           details: {},
         };
       }
-      if (pageIds.length === 0) {
-        return { content: [{ type: "text", text: "No page IDs provided." }], details: {} };
+      if (usePages && !params.source) {
+        return { content: [{ type: "text", text: "`page_ids` requires a `source`." }], details: {} };
+      }
+
+      let member: import("./collection-context.js").CollectionMember | undefined;
+      let sourceRel: string | undefined;
+      if (params.source) {
+        try {
+          member = resolveSource(collectionCtx, params.source);
+          sourceRel = relative(collectionCtx.workspaceDir, member.path);
+        } catch (e) {
+          if (usePages) return { content: [{ type: "text", text: (e as Error).message }], details: {} };
+          // image batch: a bad source ref is harmless (source unused) — ignore it.
+        }
+      }
+
+      const outputFileTemplate = params.output_file;
+      const bbox = params.bbox as Bbox | undefined;
+
+      // Validate the output template against the chosen mode.
+      if (outputFileTemplate) {
+        if (usePages && !outputFileTemplate.includes("{page_id}")) {
+          return { content: [{ type: "text", text: "output_file must contain {page_id} for a page batch." }], details: {} };
+        }
+        if (useImages && !outputFileTemplate.includes("{index}") && !outputFileTemplate.includes("{name}")) {
+          return { content: [{ type: "text", text: "output_file must contain {index} and/or {name} for an image batch." }], details: {} };
+        }
+      }
+
+      const items: BatchItem[] = [];
+      if (usePages) {
+        params.page_ids!.forEach((raw, i) => {
+          const pageId = Math.round(raw);
+          items.push({ key: `p${pageId}`, label: `p. ${pageId}`, sortIndex: i, pageId });
+        });
+      } else {
+        for (let i = 0; i < params.images!.length; i++) {
+          let imagePath: string;
+          try {
+            imagePath = resolveImagePath(collectionCtx.workspaceDir, params.images![i]);
+          } catch (e) {
+            return { content: [{ type: "text", text: `${params.images![i]}: ${(e as Error).message}` }], details: {} };
+          }
+          const base = params.images![i].replace(/\\/g, "/").split("/").pop() ?? params.images![i];
+          items.push({ key: `img${i}`, label: base, sortIndex: i, imagePath });
+        }
       }
 
       // Elevated capabilities are confirmed ONCE for the whole cohort, before any
       // expert runs. Denial aborts the batch.
       const grant: ExpertCapability[] = params.grant ?? [];
-      if (grant.length > 0 && !(await confirmExpertGrant(extCtx, grant, `all ${pageIds.length} experts in this batch`))) {
+      if (grant.length > 0 && !(await confirmExpertGrant(extCtx, grant, `all ${items.length} experts in this batch`))) {
         return {
           content: [
             {
@@ -154,13 +206,18 @@ export function createTaskBatchTool(
       // Every page starts "queued"; workers flip entries to "running" (with an
       // activity line from the expert's own loop) and then to the final entry.
       // Snapshots stream to the UI via onUpdate, coalesced to PROGRESS_EMIT_MS.
-      const live = new Map<number, LiveExpertEntry>(pageIds.map((id) => [id, { page_id: id, status: "queued" }]));
+      const live = new Map<string, LiveExpertEntry>(
+        items.map((it) => [it.key, { key: it.key, label: it.label, page_id: it.pageId, status: "queued" }]),
+      );
       let lastEmit = 0;
       let emitTimer: ReturnType<typeof setTimeout> | undefined;
       let progressClosed = false;
       const emitNow = (): void => {
         lastEmit = Date.now();
-        const entries = [...live.values()].sort((a, b) => a.page_id - b.page_id).map((e) => ({ ...e }));
+        const order = new Map(items.map((it) => [it.key, it.sortIndex]));
+        const entries = [...live.values()]
+          .sort((a, b) => (order.get(a.key) ?? 0) - (order.get(b.key) ?? 0))
+          .map((e) => ({ ...e }));
         const queued = entries.filter((e) => e.status === "queued").length;
         const running = entries.filter((e) => e.status === "running").length;
         const done = entries.filter((e) => e.status === "ok").length;
@@ -199,18 +256,28 @@ export function createTaskBatchTool(
         }, PROGRESS_EMIT_MS - elapsed);
       };
 
-      const runOne = async (pageId: number): Promise<ExpertEntry> => {
-        const filename = outputFileTemplate?.replace("{page_id}", String(pageId).padStart(4, "0"));
-        const outputPath = filename ? join(outputDir, filename) : undefined;
-        const entry = live.get(pageId)!;
+      const runOne = async (item: BatchItem): Promise<ExpertEntry> => {
+        const filename = outputFileTemplate
+          ? outputFileTemplate
+              .replace("{page_id}", item.pageId !== undefined ? String(item.pageId).padStart(4, "0") : "")
+              .replace("{index}", String(item.sortIndex + 1).padStart(4, "0"))
+              .replace("{name}", item.label.replace(/\.[^.]+$/, ""))
+          : undefined;
+        const outputPath = filename
+          ? item.pageId !== undefined && member
+            ? join(member.dataDir, filename)
+            : join(collectionCtx.workspaceDir, filename)
+          : undefined;
+        const entry = live.get(item.key)!;
         entry.status = "running";
         scheduleEmit();
         const input: ExpertTurnInput = {
-          source: params.source,
+          source: member ? params.source : undefined,
           prompt: params.prompt,
           model: params.model,
-          pageId,
-          bbox,
+          pageId: item.pageId,
+          bbox: item.pageId !== undefined ? bbox : undefined,
+          imagePath: item.imagePath,
           signal,
           grantedCaps: grant,
           outputPath,
@@ -227,20 +294,21 @@ export function createTaskBatchTool(
         };
         const result = await runExpertTurn(registry, collectionCtx, pageExpertPrompt, extCtx, input);
         let final: ExpertEntry;
+        const skel = { key: item.key, label: item.label, page_id: item.pageId };
         if (!result.ok) {
-          final = { page_id: pageId, status: "error", error: result.error };
+          final = { ...skel, status: "error", error: result.error };
         } else {
           resolvedModel = result.model;
           if (outputFileTemplate) {
             // The expert writes the file itself via save_output; report from whether it did.
             final = result.wroteOutput
-              ? { taskId: result.taskId, page_id: pageId, status: "ok", file: filename, cost: result.cost, toolUses: result.toolUses }
-              : { taskId: result.taskId, page_id: pageId, status: "ok", noOutput: true, cost: result.cost, toolUses: result.toolUses };
+              ? { ...skel, taskId: result.taskId, status: "ok", file: filename, cost: result.cost, toolUses: result.toolUses }
+              : { ...skel, taskId: result.taskId, status: "ok", noOutput: true, cost: result.cost, toolUses: result.toolUses };
           } else {
-            final = { taskId: result.taskId, page_id: pageId, status: "ok", response: result.text || "(empty response)", cost: result.cost, toolUses: result.toolUses };
+            final = { ...skel, taskId: result.taskId, status: "ok", response: result.text || "(empty response)", cost: result.cost, toolUses: result.toolUses };
           }
         }
-        live.set(pageId, { ...final });
+        live.set(item.key, { ...final });
         scheduleEmit();
         return final;
       };
@@ -250,7 +318,7 @@ export function createTaskBatchTool(
       // model omits `concurrency` AND a hard ceiling on what it may request.
       const maxConcurrency = envInt("CHRONOS_MAX_CONCURRENCY", 20, 1, 250);
       const concurrency = Math.min(params.concurrency ?? maxConcurrency, maxConcurrency);
-      const queue = [...pageIds];
+      const queue = [...items];
       if (onUpdate) emitNow(); // show the all-queued state immediately
       const workers: Promise<void>[] = [];
       for (let i = 0; i < Math.min(concurrency, queue.length); i++) {
@@ -258,8 +326,8 @@ export function createTaskBatchTool(
           (async () => {
             while (queue.length > 0) {
               if (signal?.aborted) return;
-              const pageId = queue.shift()!;
-              experts.push(await runOne(pageId));
+              const item = queue.shift()!;
+              experts.push(await runOne(item));
             }
           })(),
         );
@@ -269,7 +337,8 @@ export function createTaskBatchTool(
       // tool_execution_end would overwrite the final result in the UI.
       progressClosed = true;
       if (emitTimer) clearTimeout(emitTimer);
-      experts.sort((a, b) => a.page_id - b.page_id);
+      const orderFinal = new Map(items.map((it) => [it.key, it.sortIndex]));
+      experts.sort((a, b) => (orderFinal.get(a.key) ?? 0) - (orderFinal.get(b.key) ?? 0));
 
       const errCount = experts.filter((e) => e.status === "error").length;
       const noOutputCount = experts.filter((e) => e.noOutput).length;
@@ -280,20 +349,20 @@ export function createTaskBatchTool(
       const totalCost = experts.reduce((sum, e) => sum + (e.cost ?? 0), 0);
 
       const lines = [
-        `Batch complete: ${okCount}/${pageIds.length} succeeded` +
+        `Batch complete: ${okCount}/${items.length} succeeded` +
           (errCount > 0 ? `, ${errCount} failed` : "") +
           (noOutputCount > 0 ? `, ${noOutputCount} produced no output` : "") +
           (totalCost > 0 ? ` [total cost: $${totalCost.toFixed(4)}]` : ""),
         "",
         ...experts.map((e) =>
           e.status !== "ok"
-            ? `(failed) p.${e.page_id}: ${e.error}`
+            ? `(failed) ${e.label}: ${e.error}`
             : e.noOutput
-              ? `(no output) p.${e.page_id}: expert never called save_output — no file written [${e.taskId}]`
-              : `${e.taskId} ⇒ p.${e.page_id}${e.file ? ` → ${e.file}` : ""}`,
+              ? `(no output) ${e.label}: expert never called save_output — no file written [${e.taskId}]`
+              : `${e.taskId} ⇒ ${e.label}${e.file ? ` → ${e.file}` : ""}`,
         ),
         "",
-        "Follow up on any page with task(task_id, prompt).",
+        "Follow up on any item with task(task_id, prompt).",
       ];
 
       return {
