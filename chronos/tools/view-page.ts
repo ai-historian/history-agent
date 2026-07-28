@@ -65,8 +65,10 @@ const taskParams = Type.Object({
         "(e.g. 'entries_0042.json') itself, via a scoped save_output tool (JSON is validated before " +
         "writing) — its chat text is not captured. The tool returns a short confirmation; if the " +
         "expert never calls save_output, no file is written and that is reported. " +
-        "With a source, the path is under that source's data directory; without a source, " +
-        "it is resolved workspace-relative. Restricted/escaping paths are rejected.",
+        "The path is relative to the data directory of the source in effect — the one you pass here, " +
+        "or, on a task_id follow-up that omits `source`, the source that session already works on. " +
+        "Only when no source is in effect at all (a plain task) is it resolved workspace-relative. " +
+        "Restricted/escaping paths are rejected.",
     })
   ),
   bbox: Type.Optional(
@@ -82,6 +84,40 @@ const taskParams = Type.Object({
   ),
   grant: grantParam,
 });
+
+/**
+ * Base dir for a task's `output_file`.
+ *
+ * An explicit `source` wins; otherwise a task_id follow-up inherits the
+ * session's remembered source (mirroring expert-turn.ts's `effectiveSource`).
+ * Only a genuine plain task — no source anywhere, a supported mode — targets
+ * the workspace root. Returns "" for a ref that does not resolve, so
+ * runExpertTurn reports the source error rather than writing somewhere else.
+ */
+export function outputBaseDir(
+  ctx: CollectionContext,
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string {
+  const effective = explicitSource ?? inheritedSource;
+  if (!effective) return ctx.workspaceDir;
+  try {
+    return requireSourceDataDir(ctx, effective);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The source a `task_id` follow-up inherits — the ref its expert session
+ * remembers. Read from the registry (rebuilt from the persisted expert store on
+ * session start) because that is the very object runExpertTurn consults for its
+ * `effectiveSource`, so the output dir can never disagree with the source the
+ * expert actually views. Undefined for a new task or a sourceless session.
+ */
+function sessionSourceRef(registry: ExpertRegistry, taskId: string | undefined): string | undefined {
+  return taskId ? registry.sessions.get(taskId)?.sourceRef : undefined;
+}
 
 export function createTaskTool(
   collectionCtx: CollectionContext,
@@ -137,16 +173,7 @@ export function createTaskTool(
       if (params.output_file) {
         // A bad source ref leaves baseDir empty so runExpertTurn reports the source
         // error; a restricted/escaping output_file is a hard error here (run nothing).
-        let baseDir = "";
-        if (params.source) {
-          try {
-            baseDir = requireSourceDataDir(collectionCtx, params.source);
-          } catch {
-            baseDir = "";
-          }
-        } else {
-          baseDir = collectionCtx.workspaceDir;
-        }
+        const baseDir = outputBaseDir(collectionCtx, params.source, sessionSourceRef(registry, params.task_id));
         if (baseDir) {
           try {
             outputPath = resolveOutputFile(collectionCtx.workspaceDir, baseDir, params.output_file);
