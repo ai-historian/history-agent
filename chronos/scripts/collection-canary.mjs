@@ -179,5 +179,121 @@ function makeSource(ws, rel) {
   void out;
 }
 
+// --- R1: /select-collection must not wipe change_source additions ----------
+// Both success branches of /select-collection rebuild/clear ctx.members from
+// scratch (buildCollectionFromDiscovery for "all sources", loadCollectionInto's
+// ctx.members.clear() for a named collection) — the exact same wipe
+// session_start performs. replayExtraMembers must repair either wipe.
+{
+  const { buildCollectionFromDiscovery, deriveRef, dataKeyForRef } =
+    await import("../dist/tools/collection-context.js");
+  const { replayExtraMembers } = await import("../dist/extensions/index.js");
+  const store = await import("../dist/utils/session-collection-store.js");
+
+  const ws = workspace();
+  makeSource(ws, "InTree");
+  const sid = "sess-r1";
+
+  // An out-of-tree source, added the way change_source would (outside sources/).
+  const archiveRoot = mkdtempSync(join(tmpdir(), "ch-archive-"));
+  const archiveSource = join(archiveRoot, "Koeln_1871");
+  mkdirSync(join(archiveSource, "png"), { recursive: true });
+  writeFileSync(join(archiveSource, "png", "page_0001.png"), Buffer.alloc(8));
+
+  // A once-added source whose png/ has since vanished — replay must skip it.
+  const goneRoot = mkdtempSync(join(tmpdir(), "ch-gone-"));
+  const goneSource = join(goneRoot, "Vanished_1900"); // deliberately no png/ dir
+
+  store.saveSessionExtraMember(ws, sid, archiveSource);
+  store.saveSessionExtraMember(ws, sid, goneSource);
+
+  // The ref/dataDir a real change_source call would have produced for it.
+  const expectRef = deriveRef(ws, archiveSource);
+  const expectDataDir = join(ws, "data", dataKeyForRef(expectRef, archiveSource));
+
+  const ctx = createCollectionContext();
+  buildCollectionFromDiscovery(ctx, ws); // the wipe both call sites perform
+  check("sanity: catalog fresh from discovery has no archive member yet",
+        !ctx.members.has(expectRef));
+
+  const inTreeBefore = ctx.members.get("InTree");
+
+  replayExtraMembers(ctx, ws, sid);
+
+  check("replay adds the extra member back",
+        ctx.members.has(expectRef));
+  const replayed = ctx.members.get(expectRef);
+  check("replayed member has the same ref change_source would derive",
+        replayed?.ref === expectRef, replayed?.ref);
+  check("replayed member has the same dataDir change_source would derive",
+        replayed?.dataDir === expectDataDir,
+        `got ${replayed?.dataDir}`);
+  check("replayed member's path is the archive source",
+        replayed?.path === archiveSource);
+
+  check("a path whose png/ vanished is skipped, not added",
+        !ctx.members.has(deriveRef(ws, goneSource)));
+
+  check("an already-present ref (from discovery) is not overwritten by replay",
+        ctx.members.get("InTree") === inTreeBefore);
+
+  // Simulate the second wipe a named-collection switch performs, and replay
+  // again — the already-restored extra member must not be duplicated/replaced.
+  const archiveAfterFirstReplay = ctx.members.get(expectRef);
+  buildCollectionFromDiscovery(ctx, ws);
+  replayExtraMembers(ctx, ws, sid);
+  check("replaying again after another wipe still restores exactly one entry",
+        ctx.members.has(expectRef) && ctx.members.size === 2,
+        `size=${ctx.members.size}`);
+  void archiveAfterFirstReplay;
+}
+
+// --- R2: saveSessionExtraMember is defensive against a corrupted store -----
+// loadSessionExtraMembers already filters non-string entries out of a corrupt
+// extraMembers array; saveSessionExtraMember must be equally defensive when
+// extraMembers itself isn't an array at all (hand-edited/corrupted sidecar).
+{
+  const store = await import("../dist/utils/session-collection-store.js");
+  const ws = workspace();
+  const chronosDir = join(ws, ".chronos");
+  mkdirSync(chronosDir, { recursive: true });
+  const storeFile = join(chronosDir, "session-collections.json");
+
+  // extraMembers is a bare string rather than an array.
+  const sidStr = "sess-corrupt-string";
+  const fakePathA = join(tmpdir(), "ch-fake-archive", "A");
+  const fakePathB = join(tmpdir(), "ch-fake-archive", "B");
+  writeFileSync(storeFile, JSON.stringify({ [sidStr]: { extraMembers: fakePathA } }));
+
+  let threwString = false;
+  try {
+    store.saveSessionExtraMember(ws, sidStr, fakePathB);
+  } catch {
+    threwString = true;
+  }
+  check("saveSessionExtraMember does not throw when extraMembers is a string", !threwString);
+  check("saveSessionExtraMember replaces a corrupt string extraMembers with a clean single-entry array",
+        store.loadSessionExtraMembers(ws, sidStr).length === 1 &&
+        store.loadSessionExtraMembers(ws, sidStr)[0] === fakePathB,
+        JSON.stringify(store.loadSessionExtraMembers(ws, sidStr)));
+
+  // extraMembers is an object rather than an array.
+  const sidObj = "sess-corrupt-object";
+  const fakePathC = join(tmpdir(), "ch-fake-archive", "C");
+  writeFileSync(storeFile, JSON.stringify({ [sidObj]: { extraMembers: { oops: true } } }));
+
+  let threwObject = false;
+  try {
+    store.saveSessionExtraMember(ws, sidObj, fakePathC);
+  } catch {
+    threwObject = true;
+  }
+  check("saveSessionExtraMember does not throw when extraMembers is an object", !threwObject);
+  check("saveSessionExtraMember replaces a corrupt object extraMembers with a clean single-entry array",
+        store.loadSessionExtraMembers(ws, sidObj).length === 1 &&
+        store.loadSessionExtraMembers(ws, sidObj)[0] === fakePathC,
+        JSON.stringify(store.loadSessionExtraMembers(ws, sidObj)));
+}
+
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

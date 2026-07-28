@@ -174,6 +174,10 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Collection "${chosen}" could not be loaded (missing or empty manifest).`, "warning");
         return;
       }
+      // Both branches above rebuild/clear the catalog from scratch, which would
+      // otherwise silently drop out-of-tree sources added via change_source this
+      // session — re-add them before persisting the new selection.
+      replayExtraMembers(collectionCtx, ctx.cwd, ctx.sessionManager.getSessionId());
       saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), chosen);
 
       // Tell the viewer the active collection (picker state) and preview the first member.
@@ -255,19 +259,7 @@ export default function (pi: ExtensionAPI) {
     // Re-add out-of-tree sources added via change_source this session.
     // buildCollectionFromDiscovery above wiped them, and a named-collection
     // restore does not know about them either.
-    for (const sourcePath of loadSessionExtraMembers(ctx.cwd, ctx.sessionManager.getSessionId())) {
-      if (!existsSync(join(sourcePath, "png"))) {
-        console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
-        continue;
-      }
-      const ref = deriveRef(ctx.cwd, sourcePath);
-      if (collectionCtx.members.has(ref)) continue;
-      collectionCtx.members.set(ref, {
-        ref,
-        path: sourcePath,
-        dataDir: join(ctx.cwd, "data", dataKeyForRef(ref, sourcePath)),
-      });
-    }
+    replayExtraMembers(collectionCtx, ctx.cwd, ctx.sessionManager.getSessionId());
     // Tell the viewer which collection is active so the picker reflects it.
     emitActiveCollection(collectionCtx);
     await restoreExperts(ctx);
@@ -320,6 +312,28 @@ export default function (pi: ExtensionAPI) {
 // collection-level outputs (entity index) live, so the Data tab can surface them.
 function emitActiveCollection(collectionCtx: CollectionContext): void {
   sendToExtension({ type: "collection", name: collectionCtx.name, dataDir: collectionDataDir(collectionCtx) });
+}
+
+// Re-add out-of-tree sources added via change_source this session. Both
+// buildCollectionFromDiscovery and loadCollectionInto rebuild/clear `ctx.members`
+// from scratch, which would otherwise silently drop these: on session_start
+// (startup/switch/resume/fork) AND on /select-collection (either branch — "all
+// sources" via discovery, or a named collection via the manifest loader). Skips
+// a path whose png/ dir is gone, and a ref already present in the catalog.
+export function replayExtraMembers(ctx: CollectionContext, workspaceDir: string, sessionId: string): void {
+  for (const sourcePath of loadSessionExtraMembers(workspaceDir, sessionId)) {
+    if (!existsSync(join(sourcePath, "png"))) {
+      console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
+      continue;
+    }
+    const ref = deriveRef(workspaceDir, sourcePath);
+    if (ctx.members.has(ref)) continue;
+    ctx.members.set(ref, {
+      ref,
+      path: sourcePath,
+      dataDir: join(workspaceDir, "data", dataKeyForRef(ref, sourcePath)),
+    });
+  }
 }
 
 // ── Session auto-naming ─────────────────────────────────────────────────────

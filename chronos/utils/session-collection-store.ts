@@ -84,7 +84,7 @@ export function saveSessionExtraMember(workspaceDir: string, sessionId: string, 
   if (!sessionId || !sourcePath) return;
   const store = readStore(workspaceDir);
   const entry: Selection = store[sessionId] ?? {};
-  const existing = entry.extraMembers ?? [];
+  const existing = Array.isArray(entry.extraMembers) ? entry.extraMembers : [];
   if (existing.includes(sourcePath)) return;
   entry.extraMembers = [...existing, sourcePath];
   store[sessionId] = entry;
