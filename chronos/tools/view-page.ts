@@ -86,6 +86,51 @@ const taskParams = Type.Object({
 });
 
 /**
+ * The source in effect this call: an explicit `source` wins; otherwise a
+ * task_id follow-up inherits the session's remembered source (mirroring
+ * expert-turn.ts's `effectiveSource`). Shared by outputBaseDir and
+ * effectiveSourceRel so this precedence rule lives in exactly one place —
+ * each function keeps its own "no source at all" fallback and ref
+ * resolution local, since those genuinely differ (ctx.workspaceDir vs "").
+ */
+function effectiveRef(
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string | undefined {
+  return explicitSource ?? inheritedSource;
+}
+
+/**
+ * Resolve `ref` via `resolve`, or "" if it throws.
+ *
+ * Both outputBaseDir and effectiveSourceRel need this: a ref that fails to
+ * resolve (an unknown source today; once a later task adds it, also an
+ * ambiguous bare basename matching two members) must not throw out of these
+ * two helpers. That does NOT mean the error is silently lost end-to-end,
+ * though — both call sites in createTaskTool sit right next to a call to
+ * runExpertTurn, which independently resolves this exact same effective ref
+ * via collection-context's resolveSource and surfaces whatever it throws
+ * (including a future ambiguity error) as `result.error` to the user:
+ * outputBaseDir's catch fires *before* that call (so an empty baseDir here
+ * just skips pre-resolving output_file — runExpertTurn still reports the
+ * real error and the task fails there); effectiveSourceRel's catch fires
+ * *after* it, at a point where result.ok is already true, i.e. resolution
+ * of this same ref already succeeded, so the catch is effectively
+ * unreachable there in practice. So this is intentionally an unconditional
+ * catch-all, not narrowed by error type: nothing resolveSource /
+ * requireSourceDataDir throws is ever silently dropped overall — the ""
+ * returned here just means "let runExpertTurn be the one to tell the user
+ * why."
+ */
+function resolveOrEmpty<T>(resolve: () => T): T | "" {
+  try {
+    return resolve();
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Base dir for a task's `output_file`.
  *
  * An explicit `source` wins; otherwise a task_id follow-up inherits the
@@ -99,13 +144,9 @@ export function outputBaseDir(
   explicitSource: string | undefined,
   inheritedSource: string | undefined,
 ): string {
-  const effective = explicitSource ?? inheritedSource;
+  const effective = effectiveRef(explicitSource, inheritedSource);
   if (!effective) return ctx.workspaceDir;
-  try {
-    return requireSourceDataDir(ctx, effective);
-  } catch {
-    return "";
-  }
+  return resolveOrEmpty(() => requireSourceDataDir(ctx, effective));
 }
 
 /**
@@ -132,13 +173,9 @@ export function effectiveSourceRel(
   explicitSource: string | undefined,
   inheritedSource: string | undefined,
 ): string {
-  const effective = explicitSource ?? inheritedSource;
+  const effective = effectiveRef(explicitSource, inheritedSource);
   if (!effective) return "";
-  try {
-    return relative(ctx.workspaceDir, resolveSource(ctx, effective).path);
-  } catch {
-    return "";
-  }
+  return resolveOrEmpty(() => relative(ctx.workspaceDir, resolveSource(ctx, effective).path));
 }
 
 export function createTaskTool(

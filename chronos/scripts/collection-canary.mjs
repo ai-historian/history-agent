@@ -74,17 +74,22 @@ function makeSource(ws, rel) {
   const p = join(ws, "sources", "Frankfurt_1864");
   ctx.members.set("Frankfurt_1864", { ref: "Frankfurt_1864", path: p, dataDir: join(ws, "data", "Frankfurt_1864") });
 
+  // Composed from the same primitive relative() uses (join), not a literal —
+  // relative() returns platform-native separators (sources\Frankfurt_1864 on
+  // win32), so a hardcoded "sources/Frankfurt_1864" would false-fail there.
+  const expectRel = join("sources", "Frankfurt_1864");
+
   check("explicit source -> its rel path",
-        effectiveSourceRel(ctx, "Frankfurt_1864", undefined) === "sources/Frankfurt_1864",
+        effectiveSourceRel(ctx, "Frankfurt_1864", undefined) === expectRel,
         effectiveSourceRel(ctx, "Frankfurt_1864", undefined));
 
   // THE BUG: sourceless follow-up must still report the inherited source, not "".
   check("inherited source (sourceless follow-up) -> its rel path, not blank",
-        effectiveSourceRel(ctx, undefined, "Frankfurt_1864") === "sources/Frankfurt_1864",
+        effectiveSourceRel(ctx, undefined, "Frankfurt_1864") === expectRel,
         `got "${effectiveSourceRel(ctx, undefined, "Frankfurt_1864")}"`);
 
   check("explicit wins over inherited",
-        effectiveSourceRel(ctx, "Frankfurt_1864", "Other") === "sources/Frankfurt_1864");
+        effectiveSourceRel(ctx, "Frankfurt_1864", "Other") === expectRel);
 
   // A genuine plain task (no source anywhere) is blank, not an error.
   check("no source at all -> blank",
