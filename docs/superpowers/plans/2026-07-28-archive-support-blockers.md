@@ -15,7 +15,8 @@
 - **pi loads the agent from `chronos/dist/`.** After any change under `chronos/`, run `cd chronos && npm run build` or the canaries test stale code.
 - **esbuild does not type-check.** After extension/webview changes run both `npx tsc --noEmit -p tsconfig.json` and `-p webview/tsconfig.json`.
 - `chronos/` and `chronos-vscode/` are **independent builds with no shared code**. `chronos-vscode/tsconfig.json` has `rootDir: "src"`, so importing from `../chronos` is not possible. Duplication is the established convention (`protocol.ts`, `discoverSources`) — but see task 7, which deliberately avoids a third duplication.
-- Every fix ships a test that **fails before the fix**. Green existing tests are not evidence: all eight gates already pass on this branch.
+- Every fix ships a test that **fails before the fix**. Green existing tests are not evidence: all eight gates already pass on this branch. **One explicit exemption: task 1**, which changes only user-facing text and deletes files — it has no runtime behaviour to assert, and is verified by the full gate plus the ignore-rule check in its own steps. No other task is exempt.
+- No test may assert a literal constant. If the property under test is "this terminated rather than hanging", express it as a watchdog race, not `check(name, true)`.
 - Commit as `Lorenz Hufe <lorenz.hufe@posteo.de>`. No `Co-Authored-By: Claude` trailers.
 - Work on `fix/archive-support-blockers`. Do not commit to `master`.
 
@@ -55,13 +56,15 @@ Plus every canary added by this plan.
 
 ---
 
-### Task 1: Cheap user-facing cleanups
+### Task 1: Cheap cleanups — user-facing text and prior-run findings
 
 **Files:**
-- Modify: `chronos-vscode/walkthroughs/setup.md`, `chronos-vscode/src/workspace-templates.ts:22`, `.gitignore`
+- Modify: `chronos-vscode/walkthroughs/setup.md`, `chronos-vscode/src/workspace-templates.ts:22`, `.gitignore`, `chronos/tools/task-batch.ts:157`, `chronos/utils/crop-image.ts`
 - Delete: `memory/MEMORY.MD`, `chronos-vscode/memory/MEMORY.MD`
 
 **Interfaces:** none — no code contract changes.
+
+**Note:** this is the plan's one task exempt from the failing-test-first rule (see Global Constraints). It changes user-facing text, one parameter description, and factors out a duplicated options literal — no runtime behaviour to assert. It is verified by the full gate plus the ignore-rule check in Step 5.
 
 - [ ] **Step 1: Confirm the defects**
 
@@ -107,21 +110,44 @@ mkdir -p memory && touch memory/MEMORY.MD && git status --porcelain memory/ && e
 
 Expected: no output before the echo. Then `rm -rf memory`.
 
-- [ ] **Step 6: Build and run the full gate**
+- [ ] **Step 6: Fold in two findings the previous SDD run left unresolved**
 
-Run the full gate from the top of this plan. Expected: everything passes exactly as it did before (this task changes no logic).
+Both were recorded as Minor in `.superpowers/sdd/progress.md` and never fixed.
 
-- [ ] **Step 7: Commit**
+**(a) `chronos/tools/task-batch.ts:157`** — the `source` parameter description says it is "optional (and unused) when using images", but a valid `source` in an image batch *is* forwarded (it enables that item's view tools). This misleads the orchestrating model. Read it and tighten the wording to say that `source`, when supplied with `images`, enables the view tools for those items:
 
 ```bash
-git add chronos-vscode/walkthroughs/setup.md chronos-vscode/src/workspace-templates.ts .gitignore
+sed -n '150,165p' chronos/tools/task-batch.ts
+```
+
+**(b) `chronos/utils/crop-image.ts`** — `loadImageAsPng` (~`:72-80`) duplicates the resize options literal from `downscaleToLimit` (~`:55-64`) verbatim. Factor the shared `{ width, height, fit: "inside", withoutEnlargement: true }` construction into one small local helper used by both. Behaviour must not change: `downscaleToLimit` still returns its input untouched when already within the cap or when `maxDim <= 0`, and `loadImageAsPng` still always re-encodes.
+
+Read both functions before editing:
+
+```bash
+sed -n '50,85p' chronos/utils/crop-image.ts
+```
+
+- [ ] **Step 7: Build and run the full gate**
+
+Run the full gate from the top of this plan. Expected: everything passes exactly as it did before. `downscale-canary.mjs` is the specific guard on Step 6(b) — it must still pass, since it covers `downscaleToLimit`'s no-op-when-within-cap behaviour.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add chronos-vscode/walkthroughs/setup.md chronos-vscode/src/workspace-templates.ts .gitignore chronos/tools/task-batch.ts chronos/utils/crop-image.ts
 git commit -m "fix: strip conflict marker from the walkthrough, fix seeded typo
 
 setup.md ended with a literal <<<< that renders in the VS Code Getting
 Started walkthrough. workspace-templates.ts wrote 'design for resa
 resume' into every new workspace's SKILL.md. Also drops the two 0-byte
 MEMORY.MD files committed by dev-running the agent inside the repo, and
-ignores those paths so they cannot come back."
+ignores those paths so they cannot come back.
+
+Folds in two Minor findings the previous SDD run left unresolved: the
+task_batch source description claimed source is unused with images (it is
+forwarded, enabling that item's view tools), and loadImageAsPng
+duplicated downscaleToLimit's resize options literal."
 ```
 
 ---
@@ -159,21 +185,40 @@ const ok = { stopReason: "stop" };
 const fast = () => 1; // no real backoff in tests
 
 // 1. A hung attempt is aborted by the timeout rather than hanging forever.
+//    Raced against a watchdog: without a per-attempt timeout this call never
+//    settles, so the watchdog is what actually asserts the fix.
 {
   let seen = 0;
-  const res = await completeWithRetry(
-    (signal) => {
-      seen++;
-      // Never resolves on its own; only the abort ends it.
-      return new Promise((resolve) => {
-        signal?.addEventListener("abort", () => resolve({ stopReason: "aborted" }));
-      });
-    },
-    { retries: 2, timeoutMs: 30, delayMs: fast },
-  );
-  check("hung attempt is aborted, not hung", true); // reaching here at all is the assertion
+  const WATCHDOG_MS = 5_000;
+  let timer;
+  const watchdog = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("attempt hung — no per-attempt timeout")), WATCHDOG_MS);
+  });
+  let res;
+  let hung = false;
+  try {
+    res = await Promise.race([
+      completeWithRetry(
+        (signal) => {
+          seen++;
+          // Never resolves on its own; only the abort ends it.
+          return new Promise((resolve) => {
+            signal?.addEventListener("abort", () => resolve({ stopReason: "aborted" }));
+          });
+        },
+        { retries: 2, timeoutMs: 30, delayMs: fast },
+      ),
+      watchdog,
+    ]);
+  } catch (e) {
+    hung = true;
+  } finally {
+    clearTimeout(timer);
+  }
+  check("hung attempt is aborted, not left hanging", hung === false,
+        `did not settle within ${WATCHDOG_MS}ms`);
   check("hung attempt is retried to exhaustion", seen === 3, `attempts=${seen}`);
-  check("result reports timedOut", res.timedOut === true, JSON.stringify(res));
+  check("result reports timedOut", res?.timedOut === true, JSON.stringify(res));
 }
 
 // 2. A timeout does not consume the permanent-error path and is not reported
@@ -506,35 +551,54 @@ function makeSource(ws, rel) {
 }
 
 // --- Task 3: output_file resolution for an inherited source -----------------
-// A follow-up turn inherits session.sourceRef, so the data dir must follow the
-// EFFECTIVE source, not only an explicitly-passed one.
+// A task_id follow-up inherits session.sourceRef, so the output dir must follow
+// the EFFECTIVE source, not only an explicitly-passed one. Falling back to the
+// workspace root writes a follow-up's output outside the source's data dir
+// while the expert still views the inherited source.
 {
+  const { outputBaseDir } = await import("../dist/tools/view-page.js");
   const ws = workspace();
   const p = makeSource(ws, "Frankfurt_1864");
   const ctx = createCollectionContext(ws);
-  ctx.members.set("Frankfurt_1864", {
-    ref: "Frankfurt_1864", path: p, dataDir: join(ws, "data", "Frankfurt_1864"),
-  });
-  check("explicit source -> source data dir",
-        requireSourceDataDir(ctx, "Frankfurt_1864") === join(ws, "data", "Frankfurt_1864"),
-        requireSourceDataDir(ctx, "Frankfurt_1864"));
-  check("data dir is never the workspace root",
-        requireSourceDataDir(ctx, "Frankfurt_1864") !== ws);
+  const dataDir = join(ws, "data", "Frankfurt_1864");
+  ctx.members.set("Frankfurt_1864", { ref: "Frankfurt_1864", path: p, dataDir });
+
+  check("explicit source -> its data dir",
+        outputBaseDir(ctx, "Frankfurt_1864", undefined) === dataDir,
+        outputBaseDir(ctx, "Frankfurt_1864", undefined));
+
+  // THE BUG: no explicit source, but the session remembers one.
+  check("inherited source -> its data dir (not the workspace root)",
+        outputBaseDir(ctx, undefined, "Frankfurt_1864") === dataDir,
+        `got ${outputBaseDir(ctx, undefined, "Frankfurt_1864")} — workspace root is ${ws}`);
+
+  check("explicit wins over inherited",
+        outputBaseDir(ctx, "Frankfurt_1864", "Other") === dataDir);
+
+  // A genuine plain task (no source anywhere) still targets the workspace root.
+  check("no source at all -> workspace root",
+        outputBaseDir(ctx, undefined, undefined) === ws,
+        outputBaseDir(ctx, undefined, undefined));
+
+  // An unresolvable ref yields "" so runExpertTurn reports the source error.
+  check("unresolvable ref -> empty string",
+        outputBaseDir(ctx, "Nope", undefined) === "",
+        outputBaseDir(ctx, "Nope", undefined));
 }
 
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
 ```
 
-> This canary asserts the helper contract. The *wiring* bug — `view-page.ts` not using the effective source — is verified in Step 4 by reading the code, because reaching it through a real expert turn needs a live provider. Do not fake a provider call here.
+Note the unused-import cleanup: `requireSourceDataDir` is imported at the top of the canary but only used indirectly now — keep the import only if a later task's checks use it, otherwise drop it.
 
-- [ ] **Step 2: Build and run it**
+- [ ] **Step 2: Build and run it to verify it fails**
 
 ```bash
 cd chronos && npm run build && node scripts/collection-canary.mjs
 ```
 
-Expected: PASS (this part codifies existing correct behaviour so later tasks cannot regress it).
+Expected: FAIL — `outputBaseDir is not a function` (it does not exist yet). After Step 4 introduces it, the `inherited source -> its data dir` check is the one that must flip from failing to passing; it is the blocker.
 
 - [ ] **Step 3: Read the current output_file block**
 
@@ -554,29 +618,44 @@ grep -n "export" chronos/utils/expert-store.ts
 grep -n "task_id\|taskId" chronos/tools/view-page.ts | head
 ```
 
-Then change the base-dir selection so an inherited source is honoured:
+Extract the decision into an **exported pure function** so it is directly
+testable (the canary in Step 1 imports it), then call it from the `output_file`
+block:
 
 ```ts
-        let baseDir = "";
-        // The expert's effective source: an explicit `source` wins, otherwise a
-        // task_id follow-up inherits the session's remembered source (see
-        // expert-turn.ts's effectiveSource). Falling back to workspaceDir here
-        // would write a follow-up's output to the workspace root while the
-        // expert still views the inherited source — a silent misplacement that
-        // leaves the original file stale and still reports success.
-        const effectiveSource = params.source ?? sessionSourceRef(params.task_id);
-        if (effectiveSource) {
-          try {
-            baseDir = requireSourceDataDir(collectionCtx, effectiveSource);
-          } catch {
-            baseDir = "";
-          }
-        } else {
-          baseDir = collectionCtx.workspaceDir;
-        }
+/**
+ * Base dir for a task's `output_file`.
+ *
+ * An explicit `source` wins; otherwise a task_id follow-up inherits the
+ * session's remembered source (mirroring expert-turn.ts's `effectiveSource`).
+ * Only a genuine plain task — no source anywhere, a supported mode — targets
+ * the workspace root. Returns "" for a ref that does not resolve, so
+ * runExpertTurn reports the source error rather than writing somewhere else.
+ */
+export function outputBaseDir(
+  ctx: CollectionContext,
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string {
+  const effective = explicitSource ?? inheritedSource;
+  if (!effective) return ctx.workspaceDir;
+  try {
+    return requireSourceDataDir(ctx, effective);
+  } catch {
+    return "";
+  }
+}
 ```
 
-Implement `sessionSourceRef(taskId)` as a small local helper reading the persisted expert session's `sourceRef` via `expert-store.ts`, returning `undefined` when there is no `task_id` or no stored source. Keep the workspace-root fallback **only** for a genuine plain task (no source anywhere), which is a real supported mode on this branch.
+Then in the `output_file` block replace the whole `let baseDir = ""; if (params.source) {…} else {…}` sequence with:
+
+```ts
+        const baseDir = outputBaseDir(collectionCtx, params.source, sessionSourceRef(params.task_id));
+```
+
+Implement `sessionSourceRef(taskId)` as a small local (non-exported) helper reading the persisted expert session's `sourceRef` via `expert-store.ts`, returning `undefined` when there is no `task_id` or no stored source. Import `CollectionContext` as a type if it is not already imported.
+
+**Also fold in a prior-run finding** recorded in the SDD ledger: `view-page.ts:61-69`'s `output_file` parameter description says the path is relative to "the source data directory" only, which is stale for the sourceless workspace-relative mode — and this change makes it actively wrong for the inherited-source case too. Update that description so the model reading the schema in isolation gets the real rule: relative to the source's data dir when a source is in effect (explicit or inherited), otherwise the workspace root.
 
 - [ ] **Step 5: Typecheck, build, and run all canaries**
 
