@@ -4,7 +4,8 @@
  * Which named collection a session is working over lives in the in-memory
  * CollectionContext. A fresh agent process (or a resumed session) auto-forms the
  * "all sources" collection; if the user narrowed to a named collection we persist
- * that name here, keyed by pi session id, and re-narrow to it on session start.
+ * its `id` here (the stable identity — see collection-context.ts), keyed by pi
+ * session id, and re-narrow to it on session start.
  *
  * Absence of an entry means the auto-collection ("all sources") — selecting it
  * explicitly clears the entry. Like the other sidecars this is OUT-OF-BAND: it
@@ -14,7 +15,16 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 interface Selection {
-  /** The named collection, absent for the auto "all sources" collection. */
+  /**
+   * The selected collection's `id` (the manifest's filename stem) — NOT its
+   * display name, despite the field/JSON key being called `name`. Since Task 6
+   * introduced `id` as the stable identity, every writer here persists an id.
+   * The key stays `name` on purpose: it is the on-disk JSON key in every
+   * existing `.chronos/session-collections.json`, and callers (including the
+   * canary's legacy-entry check) read/write bare `{ "name": "<value>" }`
+   * objects — renaming the key would silently strand old entries instead of
+   * just misnaming them. Absent for the auto "all sources" collection.
+   */
   name?: string;
   /** Absolute source dirs added this session via change_source. */
   extraMembers?: string[];
@@ -45,29 +55,29 @@ function writeStore(workspaceDir: string, store: Record<string, Selection>): voi
 }
 
 /**
- * Record the named collection selected in this session. Pass `null` to record
- * the auto-collection ("all sources"), which removes any stored name.
+ * Record the collection id selected in this session. Pass `null` to record
+ * the auto-collection ("all sources"), which removes any stored id.
  */
-export function saveSessionCollection(workspaceDir: string, sessionId: string, name: string | null): void {
+export function saveSessionCollection(workspaceDir: string, sessionId: string, id: string | null): void {
   if (!sessionId) return;
   const store = readStore(workspaceDir);
   const entry: Selection = store[sessionId] ?? {};
-  if (name === null) {
-    // Auto-collection. Clear only the name — extraMembers added via
+  if (id === null) {
+    // Auto-collection. Clear only the id — extraMembers added via
     // change_source must survive, or selecting "All sources" would silently
     // drop every out-of-tree source the user added this session.
     if (entry.name === undefined) return;
     delete entry.name;
   } else {
-    if (entry.name === name) return;
-    entry.name = name;
+    if (entry.name === id) return;
+    entry.name = id;
   }
   if (isEmptySelection(entry)) delete store[sessionId];
   else store[sessionId] = entry;
   writeStore(workspaceDir, store);
 }
 
-/** The named collection selected in this session, if any (undefined = auto-collection). */
+/** The collection id selected in this session, if any (undefined = auto-collection). */
 export function loadSessionCollection(workspaceDir: string, sessionId: string): string | undefined {
   if (!sessionId) return undefined;
   const entry = readStore(workspaceDir)[sessionId];

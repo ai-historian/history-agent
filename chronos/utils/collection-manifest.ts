@@ -110,6 +110,46 @@ export function loadCollection(workspaceDir: string, id: string): CollectionCont
   return ctx.members.size > 0 ? ctx : null;
 }
 
+export interface SessionCollectionDecision {
+  /** The id to attempt loading via `loadCollectionInto`; null = stay on the
+   *  auto "all sources" collection (nothing stored, or nothing matched). */
+  idToLoad: string | null;
+  /** True when the caller should persist `idToLoad` back to the session
+   *  store — a legacy display-name selection was migrated to its id. */
+  needsRewrite: boolean;
+}
+
+/**
+ * Decide what to do with a session's stored collection selection, given the
+ * catalog of currently-available named collections. Pure — no I/O, no
+ * mutation; safe to unit-test without a filesystem.
+ *
+ * - No stored selection -> stay on the auto-collection.
+ * - Stored value matches a collection's `id` directly -> load it as-is.
+ * - Stored value matches a collection's `name` instead (pre-Task-6 session
+ *   stores persisted the display name, not the id) -> load by id and flag a
+ *   rewrite so the store gets migrated once.
+ * - No match at all (manifest deleted/renamed since selection) -> stay on
+ *   the auto-collection.
+ *
+ * `id` is checked before `name` so a collection whose `id` happens to equal
+ * another collection's `name` still resolves to the direct id match, same as
+ * the imperative "try loadCollectionInto(savedCollection) first" order this
+ * replaces.
+ */
+export function resolveSessionCollectionSelection(
+  savedCollection: string | undefined,
+  collections: Pick<CollectionSummary, "id" | "name">[],
+): SessionCollectionDecision {
+  if (!savedCollection) return { idToLoad: null, needsRewrite: false };
+  if (collections.some((c) => c.id === savedCollection)) {
+    return { idToLoad: savedCollection, needsRewrite: false };
+  }
+  const migrated = collections.find((c) => c.name === savedCollection);
+  if (migrated) return { idToLoad: migrated.id, needsRewrite: true };
+  return { idToLoad: null, needsRewrite: false };
+}
+
 /**
  * Narrow the shared collection context to a named collection, mutating it in
  * place so tools that closed over the object see the change. Returns false

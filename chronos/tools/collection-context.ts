@@ -69,9 +69,17 @@ export function dataKeyForRef(ref: string, sourcePath: string): string {
   return ref.includes("/") ? toSlug(ref) : basename(sourcePath);
 }
 
-/** Stable key for the active collection ("all-sources" for the auto-collection). */
+/**
+ * Stable key for the active collection ("all-sources" for the auto-collection).
+ * Keyed on `id` (the manifest's filename stem), not `name` — `name` is
+ * display-only and can change when a historian edits the manifest's `"name"`
+ * field without renaming the file. `id` is already a filesystem-safe path
+ * component (it's derived from an actual filename on disk via
+ * `listCollections`/`loadCollection`, never user free text), so it needs no
+ * `toSlug` pass — unlike `name`, which could contain spaces/slashes/etc.
+ */
 export function collectionKey(ctx: CollectionContext): string {
-  return ctx.name ? toSlug(ctx.name) : "all-sources";
+  return ctx.id ?? "all-sources";
 }
 
 /** Collection-level output dir (entity index, cross-source summaries). Kept out

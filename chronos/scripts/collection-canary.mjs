@@ -346,5 +346,70 @@ function makeSource(ws, rel) {
   void p;
 }
 
+// --- R14: collectionKey/collectionDataDir/collectionMemoryPath key on id,
+// not the mutable display name ------------------------------------------------
+// A manifest's `"name"` can be edited (display-only, per Task 6) without
+// renaming the file. If the key were still derived from `name`, that edit
+// would silently relocate the collection's entity index and memory file to a
+// new slug, orphaning everything written under the old one.
+{
+  const { collectionKey, collectionDataDir, collectionMemoryPath } = await import(
+    "../dist/tools/collection-context.js"
+  );
+  const ws = workspace();
+  const ctx = createCollectionContext(ws, "Frankfurt Directories", "frankfurt");
+  check("collectionKey returns the id, not a slug of the display name",
+        collectionKey(ctx) === "frankfurt", collectionKey(ctx));
+  check("collectionDataDir is built from the id",
+        collectionDataDir(ctx) === join(ws, "data", "_collections", "frankfurt"),
+        collectionDataDir(ctx));
+  check("collectionMemoryPath is built from the id",
+        collectionMemoryPath(ctx) === join(ws, "memory", "collections", "frankfurt.md"),
+        collectionMemoryPath(ctx));
+
+  // Renaming the manifest's display name (id/filename unchanged) must not
+  // move the key — this is the exact scenario R14 warned about.
+  const renamed = createCollectionContext(ws, "Frankfurt City Directories", "frankfurt");
+  check("renaming the display name does not change the key",
+        collectionKey(renamed) === "frankfurt", collectionKey(renamed));
+
+  // The auto-collection (id === null, just like name) still falls back.
+  const auto = createCollectionContext(ws, null, null);
+  check('collectionKey falls back to "all-sources" when id is null',
+        collectionKey(auto) === "all-sources", collectionKey(auto));
+}
+
+// --- R18/optional: resolveSessionCollectionSelection is the pure decision
+// extracted from session_start's migration branch — no I/O, no mutation, so
+// it can cover the highest-risk new logic (session-restore migration)
+// directly instead of only through the end-to-end UI test. -----------------
+{
+  const { resolveSessionCollectionSelection } = await import("../dist/utils/collection-manifest.js");
+  const collections = [
+    { id: "frankfurt", name: "Frankfurt Directories" },
+    { id: "mainz", name: "mainz" },
+  ];
+
+  check("no stored selection -> stay on auto-collection",
+        JSON.stringify(resolveSessionCollectionSelection(undefined, collections)) ===
+        JSON.stringify({ idToLoad: null, needsRewrite: false }));
+
+  check("stored id matches directly -> no rewrite",
+        JSON.stringify(resolveSessionCollectionSelection("frankfurt", collections)) ===
+        JSON.stringify({ idToLoad: "frankfurt", needsRewrite: false }));
+
+  check("stored legacy display name -> migrates to id, needs rewrite",
+        JSON.stringify(resolveSessionCollectionSelection("Frankfurt Directories", collections)) ===
+        JSON.stringify({ idToLoad: "frankfurt", needsRewrite: true }));
+
+  check("stored value matching neither id nor name -> stay on auto-collection",
+        JSON.stringify(resolveSessionCollectionSelection("nonexistent", collections)) ===
+        JSON.stringify({ idToLoad: null, needsRewrite: false }));
+
+  check("id is checked before name (id/name collision resolves to direct id match)",
+        JSON.stringify(resolveSessionCollectionSelection("mainz", collections)) ===
+        JSON.stringify({ idToLoad: "mainz", needsRewrite: false }));
+}
+
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

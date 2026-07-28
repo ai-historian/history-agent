@@ -25,7 +25,7 @@ import { loadExpertTasks } from "../utils/expert-store.js";
 import { loadToolText, loadPromptFile } from "../utils/tool-loader.js";
 import { listPageIds } from "../utils/page-files.js";
 import { ensureWorkspace } from "../utils/workspace.js";
-import { listCollections, loadCollectionInto } from "../utils/collection-manifest.js";
+import { listCollections, loadCollectionInto, resolveSessionCollectionSelection } from "../utils/collection-manifest.js";
 import { saveSessionCollection, loadSessionCollection } from "../utils/session-collection-store.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
@@ -251,17 +251,21 @@ export default function (pi: ExtensionAPI) {
     // to all sources if that manifest is gone).
     buildCollectionFromDiscovery(collectionCtx, ctx.cwd);
     const savedCollection = loadSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId());
-    if (savedCollection && !loadCollectionInto(collectionCtx, ctx.cwd, savedCollection)) {
-      // Migration: pre-Task-6 stores persisted the display NAME, not the id
-      // (the bug this task fixes) — try resolving the stored value against
-      // current display names once, and rewrite the store with the id on
-      // success. Otherwise keep the pre-existing silent fallback to all sources.
-      const migrated = listCollections(ctx.cwd).find((c) => c.name === savedCollection);
-      if (migrated && loadCollectionInto(collectionCtx, ctx.cwd, migrated.id)) {
-        saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), migrated.id);
+    // Pure decision (testable without I/O): which id to attempt, and whether a
+    // pre-Task-6 store (which persisted the display NAME, not the id) needs
+    // migrating. The actual load is still imperative — it touches disk and
+    // mutates collectionCtx.
+    const decision = resolveSessionCollectionSelection(savedCollection, listCollections(ctx.cwd));
+    if (decision.idToLoad) {
+      if (loadCollectionInto(collectionCtx, ctx.cwd, decision.idToLoad)) {
+        if (decision.needsRewrite) {
+          saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), decision.idToLoad);
+        }
       } else {
         console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
       }
+    } else if (savedCollection) {
+      console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
     }
     // Re-add out-of-tree sources added via change_source this session.
     // buildCollectionFromDiscovery above wiped them, and a named-collection
