@@ -28,16 +28,25 @@ export interface CollectionMember {
 
 export interface CollectionContext {
   workspaceDir: string;
-  /** Collection name (null = the auto-formed "all sources" collection). */
+  /** Collection name (null = the auto-formed "all sources" collection). Display-only — see `id`. */
   name: string | null;
+  /** The collection's stable identity — the manifest's filename stem (null =
+   *  the auto-formed "all sources" collection). Unlike `name`, this never
+   *  changes when a manifest is renamed in its own `name` field, so it's what
+   *  callers persist and match against — `name` is for display only. */
+  id: string | null;
   /** Free-text description (from a manifest); null for the auto-collection. */
   description: string | null;
   /** The catalog, keyed by member ref. */
   members: Map<string, CollectionMember>;
 }
 
-export function createCollectionContext(workspaceDir = "", name: string | null = null): CollectionContext {
-  return { workspaceDir, name, description: null, members: new Map() };
+export function createCollectionContext(
+  workspaceDir = "",
+  name: string | null = null,
+  id: string | null = null,
+): CollectionContext {
+  return { workspaceDir, name, id, description: null, members: new Map() };
 }
 
 /**
@@ -148,6 +157,7 @@ export function requireSourceDataDir(ctx: CollectionContext, ref: string | undef
 export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDir: string): void {
   ctx.workspaceDir = workspaceDir;
   ctx.name = null;
+  ctx.id = null;
   ctx.description = null;
   ctx.members.clear();
   for (const s of discoverSources(join(workspaceDir, "sources"))) {

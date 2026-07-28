@@ -41,13 +41,15 @@ interface Manifest {
 }
 
 export interface CollectionSummary {
+  /** The filename stem — the collection's stable identity; `name` is display-only. */
+  id: string;
   name: string;
   description?: string;
   memberCount: number;
 }
 
-function manifestPath(workspaceDir: string, name: string): string {
-  return join(workspaceDir, COLLECTIONS_DIR, `${name}.json`);
+function manifestPath(workspaceDir: string, id: string): string {
+  return join(workspaceDir, COLLECTIONS_DIR, `${id}.json`);
 }
 
 /** Available named collections (collections/*.json), sorted by name. */
@@ -63,8 +65,10 @@ export function listCollections(workspaceDir: string): CollectionSummary[] {
     if (!f.endsWith(".json")) continue;
     try {
       const m = JSON.parse(readFileSync(join(workspaceDir, COLLECTIONS_DIR, f), "utf-8")) as Manifest;
+      const id = f.replace(/\.json$/, "");
       out.push({
-        name: m.name ?? f.replace(/\.json$/, ""),
+        id,
+        name: m.name ?? id,
         description: m.description,
         memberCount: Array.isArray(m.members) ? m.members.length : 0,
       });
@@ -76,8 +80,8 @@ export function listCollections(workspaceDir: string): CollectionSummary[] {
 }
 
 /** Load a named collection into a fresh context, or null if absent/unparseable/empty. */
-export function loadCollection(workspaceDir: string, name: string): CollectionContext | null {
-  const p = manifestPath(workspaceDir, name);
+export function loadCollection(workspaceDir: string, id: string): CollectionContext | null {
+  const p = manifestPath(workspaceDir, id);
   if (!existsSync(p)) return null;
   let manifest: Manifest;
   try {
@@ -85,13 +89,13 @@ export function loadCollection(workspaceDir: string, name: string): CollectionCo
   } catch {
     return null;
   }
-  const ctx = createCollectionContext(workspaceDir, manifest.name ?? name);
+  const ctx = createCollectionContext(workspaceDir, manifest.name ?? id, id);
   ctx.description = manifest.description ?? null;
   for (const mm of manifest.members ?? []) {
     if (!mm || typeof mm.path !== "string") continue;
     const abs = isAbsolute(mm.path) ? mm.path : join(workspaceDir, mm.path);
     if (!existsSync(join(abs, "png"))) {
-      console.warn(`[chronos] collection "${name}": skipping member with no png/: ${mm.path}`);
+      console.warn(`[chronos] collection "${id}": skipping member with no png/: ${mm.path}`);
       continue;
     }
     const ref = mm.ref ?? deriveRef(workspaceDir, abs);
@@ -111,11 +115,12 @@ export function loadCollection(workspaceDir: string, name: string): CollectionCo
  * place so tools that closed over the object see the change. Returns false
  * (leaving the context untouched) if the manifest is missing/unparseable/empty.
  */
-export function loadCollectionInto(ctx: CollectionContext, workspaceDir: string, name: string): boolean {
-  const loaded = loadCollection(workspaceDir, name);
+export function loadCollectionInto(ctx: CollectionContext, workspaceDir: string, id: string): boolean {
+  const loaded = loadCollection(workspaceDir, id);
   if (!loaded) return false;
   ctx.workspaceDir = workspaceDir;
   ctx.name = loaded.name;
+  ctx.id = loaded.id;
   ctx.description = loaded.description;
   ctx.members.clear();
   for (const [k, v] of loaded.members) ctx.members.set(k, v);

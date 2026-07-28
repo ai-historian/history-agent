@@ -142,12 +142,15 @@ export default function (pi: ExtensionAPI) {
         if (requested === ALL_SOURCES || requested.toLowerCase() === "all") {
           chosen = null;
         } else {
-          const found = collections.find((c) => c.name === requested);
+          // Match the id first (the stable identity) and fall back to the
+          // display name for backward compatibility with anything a user
+          // already typed/scripted against the old name-as-id behavior.
+          const found = collections.find((c) => c.id === requested) ?? collections.find((c) => c.name === requested);
           if (!found) {
             ctx.ui.notify(`Collection "${requested}" not found.`, "warning");
             return;
           }
-          chosen = found.name;
+          chosen = found.id;
         }
       } else {
         const items = [
@@ -159,7 +162,7 @@ export default function (pi: ExtensionAPI) {
         const selected = await ctx.ui.select("Select a collection", items);
         if (selected === undefined) return;
         const idx = items.indexOf(selected);
-        chosen = idx <= 0 ? null : collections[idx - 1].name;
+        chosen = idx <= 0 ? null : collections[idx - 1].id;
       }
 
       // Apply to the shared context (mutated in place so tools see it).
@@ -249,7 +252,16 @@ export default function (pi: ExtensionAPI) {
     buildCollectionFromDiscovery(collectionCtx, ctx.cwd);
     const savedCollection = loadSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId());
     if (savedCollection && !loadCollectionInto(collectionCtx, ctx.cwd, savedCollection)) {
-      console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
+      // Migration: pre-Task-6 stores persisted the display NAME, not the id
+      // (the bug this task fixes) — try resolving the stored value against
+      // current display names once, and rewrite the store with the id on
+      // success. Otherwise keep the pre-existing silent fallback to all sources.
+      const migrated = listCollections(ctx.cwd).find((c) => c.name === savedCollection);
+      if (migrated && loadCollectionInto(collectionCtx, ctx.cwd, migrated.id)) {
+        saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), migrated.id);
+      } else {
+        console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
+      }
     }
     // Re-add out-of-tree sources added via change_source this session.
     // buildCollectionFromDiscovery above wiped them, and a named-collection
@@ -306,7 +318,12 @@ export default function (pi: ExtensionAPI) {
 // Tell the VS Code viewer which collection is active (picker state) and where its
 // collection-level outputs (entity index) live, so the Data tab can surface them.
 function emitActiveCollection(collectionCtx: CollectionContext): void {
-  sendToExtension({ type: "collection", name: collectionCtx.name, dataDir: collectionDataDir(collectionCtx) });
+  sendToExtension({
+    type: "collection",
+    id: collectionCtx.id,
+    name: collectionCtx.name,
+    dataDir: collectionDataDir(collectionCtx),
+  });
 }
 
 // ── Session auto-naming ─────────────────────────────────────────────────────

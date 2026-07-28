@@ -7,6 +7,8 @@ export interface SourceInfo {
 }
 
 export interface CollectionInfo {
+  /** The filename stem — the collection's stable identity; `name` is display-only. */
+  id: string;
   name: string;
   description?: string;
   memberCount: number;
@@ -27,8 +29,10 @@ export function discoverCollections(workspaceDir: string): CollectionInfo[] {
     if (!f.endsWith(".json")) continue;
     try {
       const m = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+      const id = f.replace(/\.json$/, "");
       out.push({
-        name: typeof m.name === "string" ? m.name : f.replace(/\.json$/, ""),
+        id,
+        name: typeof m.name === "string" ? m.name : id,
         description: typeof m.description === "string" ? m.description : undefined,
         memberCount: Array.isArray(m.members) ? m.members.length : 0,
       });

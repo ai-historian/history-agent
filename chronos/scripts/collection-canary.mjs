@@ -313,5 +313,38 @@ function makeSource(ws, rel) {
         JSON.stringify(store.loadSessionExtraMembers(ws, sidObj)));
 }
 
+// --- Task 6: a manifest whose name differs from its filename is selectable --
+{
+  const { listCollections, loadCollection } = await import("../dist/utils/collection-manifest.js");
+  const ws = workspace();
+  const p = makeSource(ws, "Frankfurt_1864");
+  mkdirSync(join(ws, "collections"), { recursive: true });
+  writeFileSync(join(ws, "collections", "frankfurt.json"), JSON.stringify({
+    name: "Frankfurt Directories",
+    description: "City directories",
+    members: [{ ref: "Frankfurt_1864", path: "sources/Frankfurt_1864" }],
+  }));
+
+  const list = listCollections(ws);
+  check("listCollections returns one entry", list.length === 1, JSON.stringify(list));
+  check("summary exposes the filename stem as id", list[0]?.id === "frankfurt", JSON.stringify(list[0]));
+  check("summary keeps the display name", list[0]?.name === "Frankfurt Directories", JSON.stringify(list[0]));
+
+  const loaded = loadCollection(ws, list[0].id);
+  check("loadCollection resolves by id", loaded !== null,
+        "returned null — the id/name round-trip is still broken");
+  check("loaded collection has its member", loaded?.members?.size === 1, `size=${loaded?.members?.size}`);
+
+  // A manifest with NO name field falls back to the filename for both.
+  writeFileSync(join(ws, "collections", "mainz.json"), JSON.stringify({
+    members: [{ ref: "Frankfurt_1864", path: "sources/Frankfurt_1864" }],
+  }));
+  const both = listCollections(ws);
+  const mainz = both.find((c) => c.id === "mainz");
+  check("nameless manifest -> id and name both the stem",
+        mainz?.name === "mainz", JSON.stringify(mainz));
+  void p;
+}
+
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

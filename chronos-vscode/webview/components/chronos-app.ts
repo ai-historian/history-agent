@@ -52,7 +52,8 @@ export class ChronosApp extends LitElement {
   declare toasts: Toast[];
   declare splitPct: number;
   declare currentSource: string;
-  declare collections: { name: string; description?: string; memberCount: number }[];
+  declare collections: { id: string; name: string; description?: string; memberCount: number }[];
+  /** The active collection's id (null = the auto "all sources" collection). */
   declare activeCollection: string | null;
   declare yolo: boolean;
   declare contextTokens: number;
@@ -393,12 +394,12 @@ export class ChronosApp extends LitElement {
                   .value=${this.activeCollection ?? ""}
                   @change=${(e: Event) => {
                     const v = (e.target as HTMLSelectElement).value;
-                    this.postMessage({ type: "selectCollection", name: v === "" ? null : v });
+                    this.postMessage({ type: "selectCollection", id: v === "" ? null : v });
                   }}
                 >
                   <option value="" ?selected=${this.activeCollection === null}>All sources</option>
                   ${this.collections.map(
-                    (c) => html`<option value=${c.name} ?selected=${c.name === this.activeCollection}>
+                    (c) => html`<option value=${c.id} ?selected=${c.id === this.activeCollection}>
                       ${c.name} (${c.memberCount})
                     </option>`,
                   )}

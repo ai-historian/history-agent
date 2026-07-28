@@ -51,8 +51,8 @@ export type ExtToWebview =
   | { type: "sources"; sources: { name: string; pageCount: number }[] }
   | {
       type: "collections";
-      collections: { name: string; description?: string; memberCount: number }[];
-      // Active collection name; null = the auto "all sources" collection.
+      collections: { id: string; name: string; description?: string; memberCount: number }[];
+      // Active collection id; null = the auto "all sources" collection.
       active: string | null;
     }
   | { type: "sessions"; sessions: ChronosSessionInfo[] }
@@ -100,8 +100,8 @@ export type WebviewToExt =
   | { type: "setModel"; provider: string; modelId: string }
   | { type: "setThinkingLevel"; level: ThinkingLevel }
   | { type: "selectSource"; name: string }
-  // pick the active collection; name null = the auto "all sources" collection
-  | { type: "selectCollection"; name: string | null }
+  // pick the active collection; id null = the auto "all sources" collection
+  | { type: "selectCollection"; id: string | null }
   | { type: "refreshSessions" }
   | { type: "refreshSources" }
   | { type: "uiResponse"; response: RpcExtensionUIResponse }

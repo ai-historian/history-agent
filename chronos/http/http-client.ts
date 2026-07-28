@@ -33,11 +33,13 @@ export interface ErrorMessage {
   message: string;
 }
 
-/** The active collection: its name (null = the auto "all sources" collection)
- * for the picker, and its collection-level output dir so the Data tab can
- * surface cross-source files (e.g. the entity index). */
+/** The active collection: its id (the stable identity the picker matches
+ * against; null = the auto "all sources" collection), its display name, and
+ * its collection-level output dir so the Data tab can surface cross-source
+ * files (e.g. the entity index). */
 export interface CollectionMessage {
   type: "collection";
+  id: string | null;
   name: string | null;
   dataDir: string;
 }

@@ -167,7 +167,7 @@ export class ChronosPanel {
   // Last source we pushed a data-file list for, so navigation within a source
   // doesn't re-list on every page change.
   private lastDataSource: string | undefined;
-  // Active collection name (null = auto "all sources"), pushed by the agent over
+  // Active collection id (null = auto "all sources"), pushed by the agent over
   // HTTP so the collection picker reflects the current selection.
   private activeCollection: string | null = null;
   // The active collection's output dir (data/_collections/<key>/) whose files —
@@ -591,7 +591,7 @@ export class ChronosPanel {
         });
         break;
       case "collection":
-        this.activeCollection = msg.name;
+        this.activeCollection = msg.id;
         this.activeCollectionDataDir = msg.dataDir;
         this.postCollections();
         // The collection's entity index etc. may now be visible — refresh the tab.
@@ -854,7 +854,7 @@ export class ChronosPanel {
         case "selectCollection": {
           // null → the auto "all sources" collection. "(all sources)" is the exact
           // sentinel the pi-package's /select-collection maps back to null.
-          const arg = msg.name ?? "(all sources)";
+          const arg = msg.id ?? "(all sources)";
           await this.rpc?.request({ type: "prompt", message: `/select-collection ${arg}` }, 0);
           break;
         }
