@@ -77,6 +77,11 @@ async function runAttempt<T extends CompleteLike>(
   userSignal: AbortSignal | undefined,
 ): Promise<AttemptOutcome<T>> {
   const controller = new AbortController();
+  // Adding an "abort" listener to an already-aborted signal never fires it
+  // (WHATWG semantics) — without this pre-check, a user cancel that landed
+  // before this attempt started would leave `controller.signal` un-aborted
+  // and let a real provider make an uncancelled network call.
+  if (userSignal?.aborted) controller.abort();
   let timedOut = false;
   const onUserAbort = () => controller.abort();
   userSignal?.addEventListener("abort", onUserAbort);
@@ -88,7 +93,16 @@ async function runAttempt<T extends CompleteLike>(
         }, timeoutMs)
       : undefined;
   try {
-    return { response: await attempt(controller.signal), timedOut };
+    const response = await attempt(controller.signal);
+    // The timer callback and the attempt's own resolution race: if the
+    // underlying call legitimately completes at almost exactly the timeout
+    // boundary, the timer can still fire first even though `response` is a
+    // real, usable answer. A response that resolved with neither "error" nor
+    // "aborted" is authoritative over a late-firing timer — don't let it be
+    // discarded as a timeout. Genuinely hung attempts only ever resolve via
+    // the abort listener (stopReason "aborted"), so those stay timed-out.
+    const usable = response.stopReason !== "error" && response.stopReason !== "aborted";
+    return { response, timedOut: usable ? false : timedOut };
   } catch (e) {
     // Google throws `new Error("Request aborted")` when the signal is already
     // aborted on entry, breaking pi-ai's usual resolve-with-stopReason
@@ -132,6 +146,12 @@ export async function completeWithRetry<T extends CompleteLike>(
 }
 
 function isRetryable<T extends CompleteLike>(o: AttemptOutcome<T>): boolean {
+  // A response that resolved with neither "error" nor "aborted" is a genuine
+  // success — authoritative over `timedOut`, even if a late-firing timer set
+  // it. Checked first so this can never be second-guessed by the timeout flag.
+  if (o.response !== undefined && o.response.stopReason !== "error" && o.response.stopReason !== "aborted") {
+    return false;
+  }
   if (o.timedOut) return true;
   if (o.threw !== undefined) return !isPermanentExpertError(o.threw);
   return o.response?.stopReason === "error" && !isPermanentExpertError(o.response.errorMessage);

@@ -66,6 +66,7 @@ const fast = () => 1; // no real backoff in tests
   );
   check("timeout then success -> success", res.response.stopReason === "stop", JSON.stringify(res.response));
   check("timeout then success -> 2 attempts", res.attempts === 2, `attempts=${res.attempts}`);
+  check("timeout then success -> timedOut resets to false", res.timedOut === false, JSON.stringify(res));
 }
 
 // 3. A USER abort stops immediately and is not retried.
@@ -74,12 +75,17 @@ const fast = () => 1; // no real backoff in tests
   let seen = 0;
   ac.abort();
   const res = await completeWithRetry(
-    () => { seen++; return Promise.resolve({ stopReason: "aborted" }); },
+    // Derives its result from the signal it's handed (rather than always
+    // returning "aborted") so this genuinely exercises propagation of the
+    // user's abort into the per-attempt signal, including the synchronous
+    // already-aborted pre-check.
+    (signal) => { seen++; return Promise.resolve({ stopReason: signal?.aborted ? "aborted" : "stop" }); },
     { retries: 3, timeoutMs: 1000, delayMs: fast },
     ac.signal,
   );
   check("user abort -> single attempt", seen === 1, `attempts=${seen}`);
   check("user abort -> timedOut false", res.timedOut === false, JSON.stringify(res));
+  check("user abort -> propagated into per-attempt signal", res.response.stopReason === "aborted", JSON.stringify(res.response));
 }
 
 // 4. A THROWING attempt is retried, not propagated, while retries remain.
@@ -126,6 +132,29 @@ const fast = () => 1; // no real backoff in tests
   const res = await completeWithRetry(() => Promise.resolve(ok), { retries: 1, delayMs: fast });
   check("no timeoutMs -> success, timedOut false",
         res.response.stopReason === "stop" && res.timedOut === false, JSON.stringify(res));
+}
+
+// 8. A timeout racing a genuinely successful attempt must not discard the
+//    real response: the mock ignores its signal and always resolves "stop",
+//    but only AFTER the per-attempt timeout has already fired, forcing the
+//    timer callback to win the race against the attempt's own resolution.
+//    The late-firing timer must not cause the good response to be retried
+//    or reported as a timeout.
+{
+  let seen = 0;
+  const TIMEOUT_MS = 30;
+  const res = await completeWithRetry(
+    () => {
+      seen++;
+      return new Promise((resolve) => {
+        setTimeout(() => resolve({ stopReason: "stop" }), TIMEOUT_MS * 3);
+      });
+    },
+    { retries: 2, timeoutMs: TIMEOUT_MS, delayMs: fast },
+  );
+  check("late-firing timer does not discard a real success", res.response.stopReason === "stop", JSON.stringify(res.response));
+  check("late-firing timer does not trigger a retry", seen === 1, `attempts=${seen}`);
+  check("late-firing timer is not reported as timedOut", res.timedOut === false, JSON.stringify(res));
 }
 
 console.log(failures === 0 ? "\ntimeout canary OK" : `\n${failures} FAILURE(S)`);

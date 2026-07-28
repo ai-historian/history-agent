@@ -46,7 +46,8 @@ const MAX_IMAGE_DIMENSION = envInt("CHRONOS_MAX_IMAGE_DIMENSION", 2576, 0, 100_0
 // option: the Google/Vertex providers ignore timeoutMs entirely and honour
 // only `signal`, so an abort is the only mechanism that bounds every
 // provider. A timed-out attempt is retried and is reported distinctly from a
-// user cancel.
+// user cancel. `chronos.expertRetries` and `chronos.expertRequestTimeout`
+// settings, forwarded as CHRONOS_EXPERT_RETRIES / CHRONOS_EXPERT_TIMEOUT.
 const EXPERT_RETRIES = envInt("CHRONOS_EXPERT_RETRIES", 3, 0, 10);
 const EXPERT_TIMEOUT_S = envInt("CHRONOS_EXPERT_TIMEOUT", 300, 0, 3600);
 
@@ -373,7 +374,12 @@ export async function runExpertTurn(
     // from a genuine user cancel: the composed per-attempt signal aborted,
     // not the user's own `input.signal`, however the underlying stopReason
     // ended up looking (error, aborted, or otherwise) after the abort landed.
-    if (timedOut && !input.signal?.aborted) {
+    // A response that resolved with neither "error" nor "aborted" is a real
+    // answer — checked first so it can never be discarded as a timeout just
+    // because the per-attempt timer happened to fire at almost the same
+    // moment the call legitimately completed.
+    const responseUsable = response.stopReason !== "error" && response.stopReason !== "aborted";
+    if (timedOut && !input.signal?.aborted && !responseUsable) {
       return {
         ok: false,
         taskId,
