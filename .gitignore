@@ -4,7 +4,8 @@ dist/
 *.js.map
 chronos-vscode/node_modules/
 chronos-vscode/out/
-chronos-vscode/.vscode-test/
+# VS Code test-electron download (appears wherever the UI test is run from)
+.vscode-test/
 *.tgz
 *.vsix
 *.html
