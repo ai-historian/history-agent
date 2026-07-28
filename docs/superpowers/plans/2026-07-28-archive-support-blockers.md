@@ -1296,15 +1296,25 @@ The robust fix is to stop comparing derived strings: have the host send the sour
 
 Update `SourceInfo`/the `sources` protocol member and `postSources` accordingly. Keep `value=${s.name}` — `selectSource` resolves refs leniently agent-side, and task 4 now errors rather than guessing on a genuine ambiguity.
 
-- [ ] **Step 6: Add a UI-test assertion for a nested source**
+- [ ] **Step 6: Add a UI-test assertion for a nested source — and watch it fail first**
 
-`test/run-ui-test.mjs` builds its fixture workspace itself. Extend the fixture with a **nested** source (`sources/city/Nested_1900/png/page_0001.png`) and assert that after the agent shows a page from it, the Data tab resolves — i.e. the panel's `currentSourceName` is the slug, not the basename. Read the fixture setup and the existing `dataViewer` assertions first:
+`test/run-ui-test.mjs` builds its fixture workspace itself. Extend the fixture with a **nested** source (`sources/city/Nested_1900/png/page_0001.png`) and assert that after the agent shows a page from it, the Data tab resolves — i.e. the panel's `currentSourceName` is the slug (`city--Nested_1900`), not the basename (`Nested_1900`). Read the fixture setup and the existing `dataViewer` assertions first:
 
 ```bash
 grep -n "sources/\|mkdirSync\|dataset viewer" chronos-vscode/test/run-ui-test.mjs | head -20
 ```
 
 Assert on the dumped state via the existing `chronosTest.dump` seam rather than adding new plumbing.
+
+**This step must satisfy the plan's failing-test-first constraint.** Write the fixture and the assertion, then run the UI test **before** applying Steps 2-5:
+
+```bash
+cd chronos-vscode && npm run build && node test/run-ui-test.mjs
+```
+
+Expected: FAIL on the new nested-source check, reporting the basename (`Nested_1900`) where the slug (`city--Nested_1900`) was expected — that failure IS the blocker. Only then apply the fix and re-run to green.
+
+If the assertion cannot be made to fail before the fix — for instance because the harness cannot reach `currentSourceName` for a nested source at all — stop and report that, rather than committing a test that passes either way. A test that cannot fail is worse than no test.
 
 - [ ] **Step 7: Typecheck, build, and run the tests**
 
