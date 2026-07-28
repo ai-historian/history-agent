@@ -97,13 +97,25 @@ function bootstrapReconciled(context: vscode.ExtensionContext): boolean {
 // second panel + pi subprocess before ChronosPanel.current is assigned.
 let startingSession = false;
 
-// Run a shell command as a VS Code task and resolve with its exit code. A task
-// runs in the user's shell — login-shell PATH, sudo prompts, visible output, just
-// like the integrated terminal — but unlike terminal.sendText it reports
+// Run setup commands in order, resolving with the first non-zero exit code (0 if
+// all succeed). Each command is its own task rather than one `a && b` shell line:
+// Windows PowerShell 5.1 — still the default shell on many Windows machines —
+// rejects `&&` as a statement separator, and no separator works across
+// cmd/PowerShell/POSIX shells. Tasks share a name so they reuse one terminal panel.
+function runSetupTask(name: string, commands: string[]): Promise<number> {
+  return commands.reduce<Promise<number>>(
+    (prev, command, i) =>
+      prev.then((code) => (code === 0 ? runShellTask(name, command, i === 0) : code)),
+    Promise.resolve(0),
+  );
+}
+
+// A task runs in the user's shell — login-shell PATH, sudo prompts, visible output,
+// just like the integrated terminal — but unlike terminal.sendText it reports
 // completion, so the caller can await the install and continue automatically
 // instead of asking the user to re-run the command. Never rejects: a failure to
 // launch resolves to -1 so callers handle it uniformly via the exit code.
-function runSetupTask(name: string, command: string): Promise<number> {
+function runShellTask(name: string, command: string, clear: boolean): Promise<number> {
   const task = new vscode.Task(
     { type: "chronos-setup" },
     vscode.TaskScope.Workspace,
@@ -114,7 +126,8 @@ function runSetupTask(name: string, command: string): Promise<number> {
   task.presentationOptions = {
     reveal: vscode.TaskRevealKind.Always,
     panel: vscode.TaskPanelKind.Dedicated,
-    clear: true,
+    // Only the first step clears, so a multi-step run reads as one log.
+    clear,
     focus: false,
     echo: true,
   };
@@ -168,7 +181,7 @@ async function ensureBootstrap(context: vscode.ExtensionContext): Promise<boolea
     if (choice !== "Install") return false;
     const code = await runSetupTask(
       "Install pi + Chronos agent",
-      `npm install -g ${npmPackage} && pi install ${wantedSource}`,
+      [`npm install -g ${npmPackage}`, `pi install ${wantedSource}`],
     );
     if (code !== 0 || !hasPi()) {
       vscode.window.showErrorMessage(
@@ -221,11 +234,10 @@ async function ensureBootstrap(context: vscode.ExtensionContext): Promise<boolea
     : hasLegacyPiPackage()
       ? [LEGACY_PI_PACKAGE]
       : [];
-  const migrate = removals.map((r) => `pi remove ${r} && `).join("");
-  const code = await runSetupTask(
-    `Set up Chronos pi-package (${wantedId})`,
-    `${migrate}pi install ${wantedSource}`,
-  );
+  const code = await runSetupTask(`Set up Chronos pi-package (${wantedId})`, [
+    ...removals.map((r) => `pi remove ${r}`),
+    `pi install ${wantedSource}`,
+  ]);
   if (code !== 0 || !hasChronosPiPackage()) {
     vscode.window.showErrorMessage(
       `Chronos pi-package setup failed (exit code ${code}). Check the task terminal, then run "Chronos: Install Dependencies" to retry.`,
