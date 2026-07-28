@@ -249,10 +249,18 @@ progress total.
   `px_N × (dpi_0 / dpi_N)`. So for a TIFF whose pages carry differing DPI:
   a page with *lower* DPI than page 0 is harmlessly upscaled, but a page with
   *higher* DPI than page 0 **loses detail**. Scanner output is uniform-DPI, so
-  this is accepted rather than solved — but the converter must `console.warn`
-  (surfaced into the import error/summary path) when any page's rendered
-  dimensions differ from `bounds × scale` expectations by more than a rounding
-  pixel, so a non-uniform file is not silently degraded.
+  this is accepted rather than solved.
+
+  **Corrected 2026-07-28 during planning.** An earlier draft of this spec
+  required the converter to warn "when any page's rendered dimensions differ
+  from `bounds × scale` expectations." That check is **unimplementable**:
+  rendered dimensions *are* `bounds × scale` by construction, and mupdf's Page
+  prototype (`getBounds, run, runPageContents, runPageAnnots, runPageWidgets,
+  toPixmap, toDisplayList, toStructuredText, getLinks, createLink, deleteLink`)
+  exposes no per-page image or resolution accessor — so per-page DPI cannot be
+  recovered at all, and a non-uniform file cannot be detected. The converter
+  instead emits an **unconditional** notice for any multi-page raster, naming
+  the assumed DPI and page count, surfaced in the import summary.
 - Output `page_NNNN.png` (4-digit, 1-indexed) into `png.partial/`, written to
   `.tmp` then `renameSync`d, matching `pdf-worker.ts:39` crash-safety so a resume
   can never mistake a truncated file for a finished page.
