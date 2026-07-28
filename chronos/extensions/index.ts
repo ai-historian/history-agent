@@ -10,8 +10,7 @@ import {
   buildCollectionFromDiscovery,
   collectionDataDir,
   collectionMemoryPath,
-  deriveRef,
-  dataKeyForRef,
+  replayExtraMembers,
   type CollectionContext,
 } from "../tools/collection-context.js";
 import { createListPagesTool } from "../tools/list-pages.js";
@@ -27,11 +26,7 @@ import { loadToolText, loadPromptFile } from "../utils/tool-loader.js";
 import { listPageIds } from "../utils/page-files.js";
 import { ensureWorkspace } from "../utils/workspace.js";
 import { listCollections, loadCollectionInto } from "../utils/collection-manifest.js";
-import {
-  saveSessionCollection,
-  loadSessionCollection,
-  loadSessionExtraMembers,
-} from "../utils/session-collection-store.js";
+import { saveSessionCollection, loadSessionCollection } from "../utils/session-collection-store.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
 import { connectHttp, sendToExtension, disconnectHttp } from "../http/http-client.js";
@@ -312,28 +307,6 @@ export default function (pi: ExtensionAPI) {
 // collection-level outputs (entity index) live, so the Data tab can surface them.
 function emitActiveCollection(collectionCtx: CollectionContext): void {
   sendToExtension({ type: "collection", name: collectionCtx.name, dataDir: collectionDataDir(collectionCtx) });
-}
-
-// Re-add out-of-tree sources added via change_source this session. Both
-// buildCollectionFromDiscovery and loadCollectionInto rebuild/clear `ctx.members`
-// from scratch, which would otherwise silently drop these: on session_start
-// (startup/switch/resume/fork) AND on /select-collection (either branch — "all
-// sources" via discovery, or a named collection via the manifest loader). Skips
-// a path whose png/ dir is gone, and a ref already present in the catalog.
-export function replayExtraMembers(ctx: CollectionContext, workspaceDir: string, sessionId: string): void {
-  for (const sourcePath of loadSessionExtraMembers(workspaceDir, sessionId)) {
-    if (!existsSync(join(sourcePath, "png"))) {
-      console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
-      continue;
-    }
-    const ref = deriveRef(workspaceDir, sourcePath);
-    if (ctx.members.has(ref)) continue;
-    ctx.members.set(ref, {
-      ref,
-      path: sourcePath,
-      dataDir: join(workspaceDir, "data", dataKeyForRef(ref, sourcePath)),
-    });
-  }
 }
 
 // ── Session auto-naming ─────────────────────────────────────────────────────

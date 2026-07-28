@@ -10,8 +10,10 @@
  * `members`/`workspaceDir` are mutated in place (rebuilt from discovery on each
  * session start) so tools that closed over it always see the live catalog.
  */
+import { existsSync } from "node:fs";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { discoverSources, toSlug } from "../utils/source-discovery.js";
+import { loadSessionExtraMembers } from "../utils/session-collection-store.js";
 
 export interface CollectionMember {
   /** Stable handle the agent passes as `source` — the discovery name (workspace-relative path, e.g. "Frankfurt_1864" or "city/Frankfurt_1864"). */
@@ -153,6 +155,30 @@ export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDi
       ref: s.name,
       path: s.path,
       dataDir: join(workspaceDir, "data", dataKeyForRef(s.name, s.path)),
+    });
+  }
+}
+
+/**
+ * Re-add out-of-tree sources added via change_source this session. Both
+ * buildCollectionFromDiscovery and loadCollectionInto rebuild/clear `ctx.members`
+ * from scratch, which would otherwise silently drop these: on session_start
+ * (startup/switch/resume/fork) AND on /select-collection (either branch — "all
+ * sources" via discovery, or a named collection via the manifest loader). Skips
+ * a path whose png/ dir is gone, and a ref already present in the catalog.
+ */
+export function replayExtraMembers(ctx: CollectionContext, workspaceDir: string, sessionId: string): void {
+  for (const sourcePath of loadSessionExtraMembers(workspaceDir, sessionId)) {
+    if (!existsSync(join(sourcePath, "png"))) {
+      console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
+      continue;
+    }
+    const ref = deriveRef(workspaceDir, sourcePath);
+    if (ctx.members.has(ref)) continue;
+    ctx.members.set(ref, {
+      ref,
+      path: sourcePath,
+      dataDir: join(workspaceDir, "data", dataKeyForRef(ref, sourcePath)),
     });
   }
 }

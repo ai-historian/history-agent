@@ -185,9 +185,8 @@ function makeSource(ws, rel) {
 // ctx.members.clear() for a named collection) — the exact same wipe
 // session_start performs. replayExtraMembers must repair either wipe.
 {
-  const { buildCollectionFromDiscovery, deriveRef, dataKeyForRef } =
+  const { buildCollectionFromDiscovery, deriveRef, dataKeyForRef, replayExtraMembers } =
     await import("../dist/tools/collection-context.js");
-  const { replayExtraMembers } = await import("../dist/extensions/index.js");
   const store = await import("../dist/utils/session-collection-store.js");
 
   const ws = workspace();
@@ -206,6 +205,11 @@ function makeSource(ws, rel) {
 
   store.saveSessionExtraMember(ws, sid, archiveSource);
   store.saveSessionExtraMember(ws, sid, goneSource);
+  // A persisted extra member whose deriveRef genuinely COLLIDES with a source
+  // discovered under sources/ — this is the only thing that can make the
+  // `ctx.members.has(ref)` guard's absence observable. Without this, "InTree"
+  // is never reachable from extraMembers, so removing the guard is invisible.
+  store.saveSessionExtraMember(ws, sid, join(ws, "sources", "InTree"));
 
   // The ref/dataDir a real change_source call would have produced for it.
   const expectRef = deriveRef(ws, archiveSource);
@@ -234,6 +238,12 @@ function makeSource(ws, rel) {
   check("a path whose png/ vanished is skipped, not added",
         !ctx.members.has(deriveRef(ws, goneSource)));
 
+  // extraMembers also persisted a path deriving to "InTree", which collides
+  // with the source discovery already put in ctx.members — this is a REAL
+  // collision test (unlike a ref that's never in extraMembers): if the
+  // `ctx.members.has(ref)` guard in replayExtraMembers were removed, this
+  // would overwrite the entry with a freshly-constructed (but field-identical)
+  // object, so an identity (===) comparison is required to catch it.
   check("an already-present ref (from discovery) is not overwritten by replay",
         ctx.members.get("InTree") === inTreeBefore);
 
@@ -245,7 +255,15 @@ function makeSource(ws, rel) {
   check("replaying again after another wipe still restores exactly one entry",
         ctx.members.has(expectRef) && ctx.members.size === 2,
         `size=${ctx.members.size}`);
-  void archiveAfterFirstReplay;
+  // The wipe reconstructs the member from scratch (a new object, since nothing
+  // caches the old one across a full catalog rebuild) — so assert the fields
+  // survive unchanged rather than object identity, which is expected to differ.
+  const archiveAfterSecondReplay = ctx.members.get(expectRef);
+  check("second replay reconstructs the same member fields as the first",
+        archiveAfterSecondReplay?.ref === archiveAfterFirstReplay?.ref &&
+        archiveAfterSecondReplay?.path === archiveAfterFirstReplay?.path &&
+        archiveAfterSecondReplay?.dataDir === archiveAfterFirstReplay?.dataDir,
+        JSON.stringify({ first: archiveAfterFirstReplay, second: archiveAfterSecondReplay }));
 }
 
 // --- R2: saveSessionExtraMember is defensive against a corrupted store -----
