@@ -101,21 +101,122 @@ roughly 530 MB → 2.1 GB.
 
 ### Phase 0 — Land `feat/archive-support` into `dev`
 
-Prerequisite, and review work rather than authorship: the branch's soundness is
-unverified until read. It contains a commit literally titled
-`wip: in-progress archive-support / collection-context work (checkpoint)`.
+**Status: reviewed 2026-07-28. Merge is mechanically clean; six logic blockers
+must be fixed before it lands.** Decision taken: fix all six *before* merging, so
+`dev` never contains known silently-corrupting code.
 
-1. Merge `dev` into `feat/archive-support` (it is 3 commits behind), resolve.
-2. Clean up: the branch adds a **0-byte `memory/MEMORY.MD`**, and a
-   `dev/pi-release` file (13 lines) whose purpose must be established or dropped.
-3. Verification gate — all must pass before the PR:
-   - `cd chronos && npm run build`
-   - `cd chronos-vscode && npm run build`
-   - `npx tsc --noEmit -p tsconfig.json` and `-p webview/tsconfig.json`
-   - `node scripts/rpc-spike.mjs`
-   - `node test/run-ui-test.mjs`
-4. PR into `dev` as a **real merge commit**, not a squash — the branch carries
-   its own specs and plans under `docs/superpowers/` that are worth preserving.
+#### Verification already done
+
+Merged `dev` into a throwaway `review/archive-support-integration` — **clean, no
+conflicts**. All gates pass on the merged result:
+
+| Check | Result |
+|---|---|
+| `cd chronos && npm run build` | clean |
+| `npx tsc --noEmit -p tsconfig.json` | clean |
+| `npx tsc --noEmit -p webview/tsconfig.json` | clean |
+| `cd chronos-vscode && npm run build` | clean |
+| `node scripts/rpc-spike.mjs` | 7/7 PASS |
+| `node test/run-ui-test.mjs` | 18/18 PASS |
+| `chronos/scripts/downscale-canary.mjs` | PASS |
+| `chronos/scripts/retry-canary.mjs` | PASS |
+
+Also verified clean by review: protocol wiring (all 25 `ExtToWebview` / 24
+`WebviewToExt` members handled on both sides), no XSS in new interpolations (all
+Lit text/attribute bindings), and `initWorkspace` cannot clobber a user workspace
+(`writeIfMissing` + `recursive: true` throughout, reachable only from
+`chronos.init`).
+
+**Every blocker below is a logic/path bug that no existing test exercises.** Green
+tests are not evidence of correctness here.
+
+#### Blockers — must fix before the merge
+
+1. **`output_file` on a `task` follow-up writes to the workspace root.**
+   `expert-turn.ts:240` makes a follow-up inherit `session.sourceRef`, but
+   `view-page.ts:141-149` derives the output base dir from `params.source` alone
+   and falls back to `collectionCtx.workspaceDir`. Re-running an extraction
+   writes to the wrong place, leaves the original stale, and reports success.
+2. **`resolveSource` has no ambiguity check.** `collection-context.ts:91-100`
+   returns the *first* member whose `basename(m.path)` matches, so
+   `frankfurt/Adressbuch_1864` and `mainz/Adressbuch_1864` are indistinguishable
+   — the agent silently gets one and `dataKeyForRef` writes into its `data/` dir.
+   Mirror `resolveExpertModel` (`resolve-model.ts:173-176`), which errors on an
+   ambiguous bare id.
+3. **`change_source` additions evaporate on resume.** `change-source.ts:53-55`
+   mutates the in-memory catalog only, while `buildCollectionFromDiscovery`
+   clears and repopulates from `sources/` on every `session_start`
+   (`index.ts:244`). Refs the agent was told to use start throwing mid-session.
+   Master's `saveSessionSource` persistence was dropped.
+4. **Nested sources break the Data tab and the source dropdown.**
+   `chronos-panel.ts:661,678` use `basename(sourceDir)` while the agent now uses
+   a slug (`dataKeyForRef` → `Frankfurt--1858`). Citations resolve to
+   `data/1858`, which does not exist; `postDataFiles` latches the wrong value.
+   `chronos-app.ts:420`'s `endsWith("/" + currentSource)` matcher was written for
+   a basename and no longer matches, so the header snaps to "— none —".
+5. **A collection whose manifest `name` ≠ its filename can never be selected.**
+   The picker sends the display name (`sources.ts:31`) and the loader treats it
+   as a filename (`manifestPath` → `collections/<name>.json`). Fails on resume
+   too, since `saveSessionCollection` persists the display name.
+6. **The 300s expert timeout is a no-op on Gemini/Vertex.** Verified against the
+   installed pi-ai 0.80.2: `api/google-generative-ai.js`, `api/google-vertex.js`
+   and `api/google-shared.js` contain **zero** `timeout` references (they honour
+   only `options.signal`), while `anthropic-messages.js`,
+   `openai-completions.js`, `openai-responses.js`,
+   `azure-openai-responses.js` and `openrouter-images.js` do consume it. The
+   comment at `expert-turn.ts:44-50` asserts the opposite. This is the exact
+   provider/incident combination the branch was built to fix — a stalled Gemini
+   expert holds its concurrency slot indefinitely and wedges the batch. Fix by
+   racing an `AbortController` on a timer, and correct the comment.
+
+#### Cheap fixes to fold into the landing
+
+- `chronos-vscode/walkthroughs/setup.md` ends with a literal `<<<<`
+  (conflict-marker remnant) and no trailing newline — it renders in the VS Code
+  Getting Started walkthrough.
+- `src/workspace-templates.ts:22` — "design for resa resume", written verbatim
+  into every new workspace's `skills/trace-entity/SKILL.md`.
+- Delete the two 0-byte files `memory/MEMORY.MD` and
+  `chronos-vscode/memory/MEMORY.MD` (artifacts of `ensureWorkspace(ctx.cwd)`
+  running with cwd = repo root / `chronos-vscode/`), **and add a `.gitignore`
+  rule** — nothing ignores them today, so they silently reappear and get
+  re-committed on the next dev run from those directories.
+- `dev/pi-release` is legitimate (isolated-agent-home wrapper for testing the
+  released agent) — keep it.
+
+#### Non-blocking follow-ups (do not gate the merge)
+
+- `CLAUDE.md:59` still documents `SourceContext` / `tools/source-context.ts` as
+  the source-redirection contract — that file is **deleted** and the contract
+  replaced by the `source`-per-call `CollectionContext`. `CLAUDE.md:68,72`,
+  `DOCS.md:31,36` and `README.md:92` are stale the same way. High leverage: this
+  misleads every future session working in the repo.
+- Batch robustness: one unexpected throw in a `task_batch` worker rejects
+  `Promise.all` and discards all completed (paid-for) results
+  (`task-batch.ts:333-343`); cancelled items vanish from the report so the
+  summary is indistinguishable from failure; duplicate `page_ids` collide on the
+  `live` map key; colliding `{name}` templates make two experts write one file.
+- `chronos.piAgentDir` is non-functional: `agentEnv` never sets
+  `PI_CODING_AGENT_DIR`, and only 1 of 4 agent-home reads honours the setting.
+  Either wire it or remove the setting and its `package.json` claim.
+- `.expert-chip-task` ellipsis CSS is inert (flex item with default
+  `min-width: auto`); needs `min-width: 0`.
+- `scripts/rpc-spike.mjs` no longer reflects how pi is launched (missing
+  `--skill`), which matters because CLAUDE.md designates it the launch-contract
+  canary. `scripts/skill-canary.mjs` and the two new canaries are referenced by
+  nothing — wire them into `package.json` / `TESTING.md`.
+- `chronos/utils/session-source-store.ts` is newly orphaned; existing workspaces'
+  `.chronos/session-sources.json` is now dead data.
+
+#### Landing procedure, once blockers are fixed
+
+Re-run the full gate above, then PR into `dev` as a **real merge commit**, not a
+squash — the branch carries its own specs and plans under `docs/superpowers/`
+that are worth preserving.
+
+Note: local `chronos/dist/` was rebuilt from the merged branch during this
+review, so local pi sessions now run that agent, not `dev`'s. See the `dist/`
+staleness trap — `dist/` is gitignored and survives branch switches.
 
 Note: local `chronos/dist/` is currently built from this branch (it contains
 `expert-retry.js`, `collection-manifest.js`, `env-config.js` with no source
@@ -148,10 +249,18 @@ progress total.
   `px_N × (dpi_0 / dpi_N)`. So for a TIFF whose pages carry differing DPI:
   a page with *lower* DPI than page 0 is harmlessly upscaled, but a page with
   *higher* DPI than page 0 **loses detail**. Scanner output is uniform-DPI, so
-  this is accepted rather than solved — but the converter must `console.warn`
-  (surfaced into the import error/summary path) when any page's rendered
-  dimensions differ from `bounds × scale` expectations by more than a rounding
-  pixel, so a non-uniform file is not silently degraded.
+  this is accepted rather than solved.
+
+  **Corrected 2026-07-28 during planning.** An earlier draft of this spec
+  required the converter to warn "when any page's rendered dimensions differ
+  from `bounds × scale` expectations." That check is **unimplementable**:
+  rendered dimensions *are* `bounds × scale` by construction, and mupdf's Page
+  prototype (`getBounds, run, runPageContents, runPageAnnots, runPageWidgets,
+  toPixmap, toDisplayList, toStructuredText, getLinks, createLink, deleteLink`)
+  exposes no per-page image or resolution accessor — so per-page DPI cannot be
+  recovered at all, and a non-uniform file cannot be detected. The converter
+  instead emits an **unconditional** notice for any multi-page raster, naming
+  the assumed DPI and page count, surfaced in the import summary.
 - Output `page_NNNN.png` (4-digit, 1-indexed) into `png.partial/`, written to
   `.tmp` then `renameSync`d, matching `pdf-worker.ts:39` crash-safety so a resume
   can never mistake a truncated file for a finished page.
