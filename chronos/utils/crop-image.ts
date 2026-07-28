@@ -22,6 +22,10 @@ function bboxToPixels(bbox: Bbox, width: number, height: number) {
   return { left, top, cropW, cropH };
 }
 
+function getResizeOptions(maxDim: number) {
+  return { width: maxDim, height: maxDim, fit: "inside" as const, withoutEnlargement: true };
+}
+
 /**
  * Crop a PNG file to the given normalized bbox (0–1) and return the result as a base64 string.
  */
@@ -58,7 +62,7 @@ export async function downscaleToLimit(png: Buffer, maxDim: number): Promise<Buf
   const { width, height } = await img.metadata();
   if (!width || !height || Math.max(width, height) <= maxDim) return png;
   return img
-    .resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true })
+    .resize(getResizeOptions(maxDim))
     .png()
     .toBuffer();
 }
@@ -73,7 +77,7 @@ export async function loadImageAsPng(imgPath: string, maxDim: number): Promise<B
   if (!existsSync(imgPath)) throw new Error(`Image not found: ${imgPath}`);
   let img = sharp(readFileSync(imgPath));
   if (maxDim > 0) {
-    img = img.resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true });
+    img = img.resize(getResizeOptions(maxDim));
   }
   return img.png().toBuffer();
 }

@@ -12,3 +12,6 @@ paper.md
 win-vm.md
 soduco/
 assets/originals/
+# Workspace artifacts from dev-running the agent inside the repo
+/memory/
+/chronos-vscode/memory/

@@ -17,4 +17,3 @@ pi install https://github.com/ai-historian/chronos@v<version>
 
 The checkmark appears once `pi` and the package are detected — a few seconds
 after the terminal finishes.
-<<<<

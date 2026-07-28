@@ -45,8 +45,8 @@ const taskBatchParams = Type.Object({
     Type.String({
       description:
         "Collection member ref every expert works on. Required when using page_ids. " +
-        "With images it is optional: if it resolves, each expert also gets that source's " +
-        "view_page/view_region tools; a bad/absent ref is ignored.",
+        "With images it is optional: when supplied, enables that source's view_page/view_region " +
+        "tools for each image item; a bad/absent ref is ignored.",
     }),
   ),
   page_ids: Type.Optional(

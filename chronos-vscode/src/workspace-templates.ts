@@ -19,7 +19,7 @@ directories 1850–1900"). The goal is a **cited entity index** plus a narrative
 every claim traceable to a source page.
 
 This is long-horizon work: it spans many sources and often outlives a single context window, so
-you **persist as you go** and design for resa resume. Never hold the whole trace in your head.
+you **persist as you go** and design for resume. Never hold the whole trace in your head.
 
 ## 0. Scope the task
 
