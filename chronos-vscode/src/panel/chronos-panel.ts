@@ -8,6 +8,7 @@ import type { ModelInfo, RpcExtensionUIRequest, RpcSessionState, RpcSlashCommand
 import type { AgentToExtensionMessage } from "../protocol";
 import type { Bbox, ExtToWebview, WebviewToExt } from "./webview-protocol";
 import { discoverSources, countPages, discoverCollections } from "./sources";
+import { deriveDataKeyFallback } from "./data-key";
 import { listSessions, readSessionMessages } from "./sessions";
 import {
   beginAnthropicLogin,
@@ -164,20 +165,21 @@ export class ChronosPanel {
   private currentSourceName: string | undefined;
 
   // The agent owns the data-dir key: flat sources use basename(path), nested
-  // refs are slugged (city/X -> city--X). Rather than re-deriving it here —
-  // which would mean duplicating dataKeyForRef, toSlug AND deriveRef across a
-  // package boundary with no shared code — record the key the agent already
-  // sends on every viewer message and look it up by directory.
+  // refs are slugged (city/X -> city--X). The cache of what the agent has
+  // already told us wins when present (cheapest, and exactly what the agent
+  // is using); `deriveDataKeyFallback` (./data-key.ts) covers a cold cache —
+  // e.g. resuming a session and citing a nested source the agent hasn't sent
+  // a viewer message about yet this run — by mirroring the agent's own
+  // derivation instead of a bare `basename`, which is wrong for nested
+  // sources (see data-key.ts for why the duplication is unavoidable).
   private dataKeyBySourceDir = new Map<string, string>();
 
   private rememberDataKey(sourceDir: string, dataKey: string): void {
     if (sourceDir && dataKey) this.dataKeyBySourceDir.set(sourceDir, dataKey);
   }
 
-  // Falls back to basename only for a directory the agent has never named,
-  // which is the pre-existing behaviour for flat sources and correct for them.
   private dataKeyForSourceDir(sourceDir: string): string {
-    return this.dataKeyBySourceDir.get(sourceDir) ?? basename(sourceDir);
+    return this.dataKeyBySourceDir.get(sourceDir) ?? deriveDataKeyFallback(this.workspaceDir, sourceDir);
   }
 
   private firstPage = 1;

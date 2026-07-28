@@ -4,6 +4,7 @@
 const vscode = require("vscode");
 const { mkdirSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -206,16 +207,30 @@ exports.run = async function run() {
   });
   check("expert drawer surfaces tool-use viewer links + flagged elevated actions", true);
 
+  // The expected data-dir key for each nested fixture source is computed here
+  // from the agent's OWN derivation (chronos/tools/collection-context.js,
+  // built to chronos/dist by `cd chronos && npm run build`) rather than
+  // hardcoded — a literal like "city--Nested_1900" would just be restating
+  // what the mock happens to send, not proving the host derives it correctly.
+  const { deriveRef, dataKeyForRef } = await import(
+    pathToFileURL(join(__dirname, "..", "..", "chronos", "dist", "tools", "collection-context.js")).href
+  );
+  const expectedDataKeyFor = (relSourcePath) => {
+    const sourceDir = join(ws, "sources", ...relSourcePath.split("/"));
+    return dataKeyForRef(deriveRef(ws, sourceDir), sourceDir);
+  };
+
   // 10. Nested sources (blocker 4): the agent slugs a nested source's data key
   //     (sources/city/Nested_1900 -> data/city--Nested_1900), but the host used
   //     to re-derive sourceName via basename(sourceDir) whenever a citation
   //     carried an explicit chronos_source — even one naming the already-active
   //     source — clobbering currentSource with the raw directory basename.
+  const expectedNestedKey = expectedDataKeyFor("city/Nested_1900");
   api.chronosTest.invoke("sendPrompt", "select-nested: city/Nested_1900");
-  await waitFor("nested source active in viewer", async () => (await dump())?.currentSource === "city--Nested_1900");
+  await waitFor("nested source active in viewer", async () => (await dump())?.currentSource === expectedNestedKey);
   check("agent-initiated show_page resolves the nested source to its slug", true);
 
-  const nestedDataDir = join(ws, "data", "city--Nested_1900");
+  const nestedDataDir = join(ws, "data", expectedNestedKey);
   mkdirSync(nestedDataDir, { recursive: true });
   writeFileSync(
     join(nestedDataDir, "citation.json"),
@@ -232,15 +247,49 @@ exports.run = async function run() {
 
   // The row cites its own (already-active) source explicitly via chronos_source
   // — this is what drives previewSource/openViewLink down the sourcePath branch
-  // even though the cited source is already current.
+  // even though the cited source is already current. This exercises the WARM
+  // cache path only: dataKeyBySourceDir already has an entry for this exact
+  // directory from the show_page above.
   api.chronosTest.invoke("viewFirstRow");
   api.chronosTest.invoke("showFullPage");
   await waitFor("citation click round-trips to the source viewer", async () => (await dump())?.viewerTab === "page");
   const afterCitation = await dump();
   check(
     "citation click for a nested source resolves currentSource to the agent's data-dir slug, not basename(sourceDir)",
-    afterCitation?.currentSource === "city--Nested_1900",
-    `currentSource=${afterCitation?.currentSource}`,
+    afterCitation?.currentSource === expectedNestedKey,
+    `currentSource=${afterCitation?.currentSource}, expected=${expectedNestedKey}`,
+  );
+
+  // 11. Cold cache (F2 regression): the check above only proves the WARM path
+  //     (citing a source right after its own show_page primed the cache).
+  //     Resuming a session, or reloading VS Code, then clicking a citation for
+  //     a nested source the agent hasn't mentioned yet THIS session is the
+  //     ordinary case that hit the bug — dataKeyBySourceDir has no entry for
+  //     sources/city/Nested_1875 at all here; nothing above ever sent a
+  //     show_page/page_list naming it. The host must fall back to deriving
+  //     the key (data-key.ts), not basename(sourceDir).
+  const expectedColdKey = expectedDataKeyFor("city/Nested_1875");
+  writeFileSync(
+    join(nestedDataDir, "cold-citation.json"),
+    JSON.stringify(
+      [{ name: "cold row", chronos_page: 1, chronos_bbox: [0.1, 0.1, 0.4, 0.1], chronos_source: "city/Nested_1875" }],
+      null,
+      2,
+    ),
+  );
+  api.chronosTest.invoke("openDataTab");
+  await waitFor("cold-cache data file listed", async () => (await dump())?.data?.files?.includes("cold-citation.json"));
+  api.chronosTest.invoke("selectDataFile", "cold-citation.json");
+  await waitFor("cold-cache data file selected", async () => (await dump())?.data?.selected === "cold-citation.json");
+
+  api.chronosTest.invoke("viewFirstRow");
+  api.chronosTest.invoke("showFullPage");
+  await waitFor("cold-cache citation click round-trips to the source viewer", async () => (await dump())?.viewerTab === "page");
+  const afterColdCitation = await dump();
+  check(
+    "citation click for a NEVER-VISITED nested source resolves to the agent's data-dir slug (cold cache), not basename(sourceDir)",
+    afterColdCitation?.currentSource === expectedColdKey,
+    `currentSource=${afterColdCitation?.currentSource}, expected=${expectedColdKey}`,
   );
 
   // Make sure the subprocess stayed alive throughout
