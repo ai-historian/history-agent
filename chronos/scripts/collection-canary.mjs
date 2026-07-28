@@ -60,5 +60,42 @@ function makeSource(ws, rel) {
         outputBaseDir(ctx, "Nope", undefined));
 }
 
+// --- R1: details.source for an inherited source (task_id follow-up) --------
+// A sourceless task_id follow-up still self-zooms (view_page/view_region)
+// against the session's inherited source, so details.source/the @path
+// citation must reflect that effective source, not params.source alone —
+// otherwise a citation chip from such a turn opens whatever source the panel
+// currently happens to have open.
+{
+  const { effectiveSourceRel } = await import("../dist/tools/view-page.js");
+  const ws = workspace();
+  makeSource(ws, "Frankfurt_1864");
+  const ctx = createCollectionContext(ws);
+  const p = join(ws, "sources", "Frankfurt_1864");
+  ctx.members.set("Frankfurt_1864", { ref: "Frankfurt_1864", path: p, dataDir: join(ws, "data", "Frankfurt_1864") });
+
+  check("explicit source -> its rel path",
+        effectiveSourceRel(ctx, "Frankfurt_1864", undefined) === "sources/Frankfurt_1864",
+        effectiveSourceRel(ctx, "Frankfurt_1864", undefined));
+
+  // THE BUG: sourceless follow-up must still report the inherited source, not "".
+  check("inherited source (sourceless follow-up) -> its rel path, not blank",
+        effectiveSourceRel(ctx, undefined, "Frankfurt_1864") === "sources/Frankfurt_1864",
+        `got "${effectiveSourceRel(ctx, undefined, "Frankfurt_1864")}"`);
+
+  check("explicit wins over inherited",
+        effectiveSourceRel(ctx, "Frankfurt_1864", "Other") === "sources/Frankfurt_1864");
+
+  // A genuine plain task (no source anywhere) is blank, not an error.
+  check("no source at all -> blank",
+        effectiveSourceRel(ctx, undefined, undefined) === "",
+        `"${effectiveSourceRel(ctx, undefined, undefined)}"`);
+
+  // An unresolvable ref is blank too (mirrors outputBaseDir's error handling).
+  check("unresolvable ref -> blank",
+        effectiveSourceRel(ctx, "Nope", undefined) === "",
+        `"${effectiveSourceRel(ctx, "Nope", undefined)}"`);
+}
+
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

@@ -119,6 +119,28 @@ function sessionSourceRef(registry: ExpertRegistry, taskId: string | undefined):
   return taskId ? registry.sessions.get(taskId)?.sourceRef : undefined;
 }
 
+/**
+ * Workspace-relative path of the EFFECTIVE source (same rule as
+ * outputBaseDir: explicit `source` wins, else a task_id follow-up's inherited
+ * source). Feeds details.source/the @path citation, so a sourceless follow-up
+ * — which can still self-zoom via view_page/view_region against the
+ * inherited source — reports the source the expert actually viewed, not
+ * undefined. "" when no source is in effect, or the ref does not resolve.
+ */
+export function effectiveSourceRel(
+  ctx: CollectionContext,
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string {
+  const effective = explicitSource ?? inheritedSource;
+  if (!effective) return "";
+  try {
+    return relative(ctx.workspaceDir, resolveSource(ctx, effective).path);
+  } catch {
+    return "";
+  }
+}
+
 export function createTaskTool(
   collectionCtx: CollectionContext,
   registry: ExpertRegistry,
@@ -231,16 +253,10 @@ export function createTaskTool(
 
       // Workspace-relative source path — used both to source-qualify the citation
       // (@path) and passed in details.source so the expert transcript's page/region
-      // chips open this task's source, not whichever was shown last. The turn
-      // succeeded, so params.source resolves; guard anyway.
-      let sourceRel = "";
-      if (params.source) {
-        try {
-          sourceRel = relative(collectionCtx.workspaceDir, resolveSource(collectionCtx, params.source).path);
-        } catch {
-          sourceRel = "";
-        }
-      }
+      // chips open this task's source, not whichever was shown last. Derived from
+      // the same effective source as output_file above (explicit `source` wins,
+      // else the task_id follow-up's inherited source) — see effectiveSourceRel.
+      const sourceRel = effectiveSourceRel(collectionCtx, params.source, sessionSourceRef(registry, params.task_id));
       const src = sourceRel ? `@${sourceRel}` : "";
       const viewLink =
         pageId === null
