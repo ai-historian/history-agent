@@ -6,6 +6,7 @@ import { listPageIds } from "../utils/page-files.js";
 import { sendToExtension } from "../http/http-client.js";
 import type { CollectionContext } from "./collection-context.js";
 import { deriveRef, dataKeyForRef } from "./collection-context.js";
+import { saveSessionExtraMember } from "../utils/session-collection-store.js";
 
 const changeSourceParams = Type.Object({
   source_path: Type.String({
@@ -53,6 +54,12 @@ export function createChangeSourceTool(ctx: CollectionContext, description: stri
       if (!ctx.members.has(ref)) {
         ctx.members.set(ref, { ref, path: sourcePath, dataDir });
       }
+
+      // Persist the addition so it survives the next session_start.
+      // buildCollectionFromDiscovery rebuilds the in-memory catalog from
+      // sources/ on every startup/switch/resume/fork, which would otherwise
+      // wipe this out-of-tree source with nothing to restore it from.
+      saveSessionExtraMember(workspaceDir, extCtx.sessionManager.getSessionId(), sourcePath);
 
       const pages = listPageIds(sourcePath);
       sendToExtension({

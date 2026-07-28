@@ -14,7 +14,15 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 interface Selection {
-  name: string;
+  /** The named collection, absent for the auto "all sources" collection. */
+  name?: string;
+  /** Absolute source dirs added this session via change_source. */
+  extraMembers?: string[];
+}
+
+/** True when an entry carries nothing worth keeping. */
+function isEmptySelection(s: Selection | undefined): boolean {
+  return !s || (s.name === undefined && (s.extraMembers === undefined || s.extraMembers.length === 0));
 }
 
 function storePath(workspaceDir: string): string {
@@ -43,13 +51,19 @@ function writeStore(workspaceDir: string, store: Record<string, Selection>): voi
 export function saveSessionCollection(workspaceDir: string, sessionId: string, name: string | null): void {
   if (!sessionId) return;
   const store = readStore(workspaceDir);
+  const entry: Selection = store[sessionId] ?? {};
   if (name === null) {
-    if (!(sessionId in store)) return;
-    delete store[sessionId];
+    // Auto-collection. Clear only the name — extraMembers added via
+    // change_source must survive, or selecting "All sources" would silently
+    // drop every out-of-tree source the user added this session.
+    if (entry.name === undefined) return;
+    delete entry.name;
   } else {
-    if (store[sessionId]?.name === name) return;
-    store[sessionId] = { name };
+    if (entry.name === name) return;
+    entry.name = name;
   }
+  if (isEmptySelection(entry)) delete store[sessionId];
+  else store[sessionId] = entry;
   writeStore(workspaceDir, store);
 }
 
@@ -58,4 +72,29 @@ export function loadSessionCollection(workspaceDir: string, sessionId: string): 
   if (!sessionId) return undefined;
   const entry = readStore(workspaceDir)[sessionId];
   return entry && typeof entry.name === "string" ? entry.name : undefined;
+}
+
+/**
+ * Remember an out-of-tree source added this session via change_source.
+ * buildCollectionFromDiscovery repopulates from sources/ on every session_start
+ * (startup, switch, resume, fork), so without this the addition is lost and the
+ * refs the agent was told to use start throwing mid-conversation.
+ */
+export function saveSessionExtraMember(workspaceDir: string, sessionId: string, sourcePath: string): void {
+  if (!sessionId || !sourcePath) return;
+  const store = readStore(workspaceDir);
+  const entry: Selection = store[sessionId] ?? {};
+  const existing = entry.extraMembers ?? [];
+  if (existing.includes(sourcePath)) return;
+  entry.extraMembers = [...existing, sourcePath];
+  store[sessionId] = entry;
+  writeStore(workspaceDir, store);
+}
+
+/** Out-of-tree source dirs added in this session (empty when none). */
+export function loadSessionExtraMembers(workspaceDir: string, sessionId: string): string[] {
+  if (!sessionId) return [];
+  const entry = readStore(workspaceDir)[sessionId];
+  const extras = entry?.extraMembers;
+  return Array.isArray(extras) ? extras.filter((p): p is string => typeof p === "string") : [];
 }

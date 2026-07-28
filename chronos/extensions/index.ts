@@ -10,6 +10,8 @@ import {
   buildCollectionFromDiscovery,
   collectionDataDir,
   collectionMemoryPath,
+  deriveRef,
+  dataKeyForRef,
   type CollectionContext,
 } from "../tools/collection-context.js";
 import { createListPagesTool } from "../tools/list-pages.js";
@@ -25,7 +27,11 @@ import { loadToolText, loadPromptFile } from "../utils/tool-loader.js";
 import { listPageIds } from "../utils/page-files.js";
 import { ensureWorkspace } from "../utils/workspace.js";
 import { listCollections, loadCollectionInto } from "../utils/collection-manifest.js";
-import { saveSessionCollection, loadSessionCollection } from "../utils/session-collection-store.js";
+import {
+  saveSessionCollection,
+  loadSessionCollection,
+  loadSessionExtraMembers,
+} from "../utils/session-collection-store.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
 import { connectHttp, sendToExtension, disconnectHttp } from "../http/http-client.js";
@@ -245,6 +251,22 @@ export default function (pi: ExtensionAPI) {
     const savedCollection = loadSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId());
     if (savedCollection && !loadCollectionInto(collectionCtx, ctx.cwd, savedCollection)) {
       console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
+    }
+    // Re-add out-of-tree sources added via change_source this session.
+    // buildCollectionFromDiscovery above wiped them, and a named-collection
+    // restore does not know about them either.
+    for (const sourcePath of loadSessionExtraMembers(ctx.cwd, ctx.sessionManager.getSessionId())) {
+      if (!existsSync(join(sourcePath, "png"))) {
+        console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
+        continue;
+      }
+      const ref = deriveRef(ctx.cwd, sourcePath);
+      if (collectionCtx.members.has(ref)) continue;
+      collectionCtx.members.set(ref, {
+        ref,
+        path: sourcePath,
+        dataDir: join(ctx.cwd, "data", dataKeyForRef(ref, sourcePath)),
+      });
     }
     // Tell the viewer which collection is active so the picker reflects it.
     emitActiveCollection(collectionCtx);

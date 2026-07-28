@@ -135,5 +135,49 @@ function makeSource(ws, rel) {
         resolveSource(ctx, "Frankfurt_1864").path === p);
 }
 
+// --- Task 5: change_source additions survive a session_start ---------------
+{
+  const store = await import("../dist/utils/session-collection-store.js");
+  const ws = workspace();
+  const out = makeSource(ws, "InTree");
+  const sid = "sess-1";
+
+  store.saveSessionExtraMember(ws, sid, "/mnt/archive/Koeln_1871");
+  check("extra member persists", store.loadSessionExtraMembers(ws, sid).includes("/mnt/archive/Koeln_1871"),
+        JSON.stringify(store.loadSessionExtraMembers(ws, sid)));
+
+  store.saveSessionExtraMember(ws, sid, "/mnt/archive/Koeln_1871");
+  check("extra member add is idempotent", store.loadSessionExtraMembers(ws, sid).length === 1,
+        JSON.stringify(store.loadSessionExtraMembers(ws, sid)));
+
+  // THE TRAP: selecting a named collection then "all sources" must not wipe them.
+  store.saveSessionCollection(ws, sid, "frankfurt");
+  check("name and extraMembers coexist",
+        store.loadSessionCollection(ws, sid) === "frankfurt" &&
+        store.loadSessionExtraMembers(ws, sid).length === 1);
+
+  store.saveSessionCollection(ws, sid, null);
+  check("selecting all-sources clears name but KEEPS extra members",
+        store.loadSessionCollection(ws, sid) === undefined &&
+        store.loadSessionExtraMembers(ws, sid).length === 1,
+        `name=${store.loadSessionCollection(ws, sid)} extras=${JSON.stringify(store.loadSessionExtraMembers(ws, sid))}`);
+
+  // A legacy entry written as {name} must still read.
+  const legacy = workspace();
+  mkdirSync(join(legacy, ".chronos"), { recursive: true });
+  writeFileSync(join(legacy, ".chronos", "session-collections.json"),
+    JSON.stringify({ "sess-old": { name: "mainz" } }));
+  check("legacy {name} entry still reads",
+        store.loadSessionCollection(legacy, "sess-old") === "mainz");
+  check("legacy entry has no extra members",
+        store.loadSessionExtraMembers(legacy, "sess-old").length === 0);
+
+  // Unknown sessions are empty, not undefined.
+  check("unknown session -> empty array",
+        Array.isArray(store.loadSessionExtraMembers(ws, "nope")) &&
+        store.loadSessionExtraMembers(ws, "nope").length === 0);
+  void out;
+}
+
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
