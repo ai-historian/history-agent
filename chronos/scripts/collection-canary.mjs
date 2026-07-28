@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { createCollectionContext } = await import("../dist/tools/collection-context.js");
+const { createCollectionContext, resolveSource } = await import("../dist/tools/collection-context.js");
 
 let failures = 0;
 const check = (name, cond, detail = "") => {
@@ -100,6 +100,39 @@ function makeSource(ws, rel) {
   check("unresolvable ref -> blank",
         effectiveSourceRel(ctx, "Nope", undefined) === "",
         `"${effectiveSourceRel(ctx, "Nope", undefined)}"`);
+}
+
+// --- Task 4: ambiguous bare basenames must error, not guess -----------------
+{
+  const ws = workspace();
+  const a = makeSource(ws, join("frankfurt", "Adressbuch_1864"));
+  const b = makeSource(ws, join("mainz", "Adressbuch_1864"));
+  const ctx = createCollectionContext(ws);
+  ctx.members.set("frankfurt/Adressbuch_1864",
+    { ref: "frankfurt/Adressbuch_1864", path: a, dataDir: join(ws, "data", "frankfurt--Adressbuch_1864") });
+  ctx.members.set("mainz/Adressbuch_1864",
+    { ref: "mainz/Adressbuch_1864", path: b, dataDir: join(ws, "data", "mainz--Adressbuch_1864") });
+
+  let msg = "";
+  try { resolveSource(ctx, "Adressbuch_1864"); } catch (e) { msg = e.message; }
+  check("ambiguous basename throws", msg !== "", "resolved silently instead of throwing");
+  check("ambiguous error names both refs",
+        msg.includes("frankfurt/Adressbuch_1864") && msg.includes("mainz/Adressbuch_1864"), msg);
+
+  // An exact ref still resolves.
+  check("exact ref still resolves",
+        resolveSource(ctx, "mainz/Adressbuch_1864").path === b);
+}
+
+// An UNambiguous basename must still resolve — the lenient alias is a feature.
+{
+  const ws = workspace();
+  const p = makeSource(ws, join("city", "Frankfurt_1864"));
+  const ctx = createCollectionContext(ws);
+  ctx.members.set("city/Frankfurt_1864",
+    { ref: "city/Frankfurt_1864", path: p, dataDir: join(ws, "data", "city--Frankfurt_1864") });
+  check("unambiguous basename still resolves",
+        resolveSource(ctx, "Frankfurt_1864").path === p);
 }
 
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);

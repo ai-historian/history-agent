@@ -88,10 +88,22 @@ export function refList(ctx: CollectionContext): string {
 
 // Lenient fallback so the agent can pass the human-obvious name. Mirrors the
 // /select-source match (exact ref → basename → workspace-relative path).
+//
+// A bare basename shared by two members is AMBIGUOUS and must not be guessed:
+// nested sources keep distinct refs but can share a basename, and silently
+// picking one writes the extraction into the wrong source's data dir. Mirrors
+// resolveExpertModel, which errors on an ambiguous bare model id.
 function resolveByAlias(ctx: CollectionContext, ref: string): CollectionMember | undefined {
-  for (const m of ctx.members.values()) {
-    if (basename(m.path) === ref) return m;
+  const byBasename = [...ctx.members.values()].filter((m) => basename(m.path) === ref);
+  if (byBasename.length > 1) {
+    const refs = byBasename.map((m) => m.ref).sort().join(", ");
+    throw new Error(
+      `Source "${ref}" is ambiguous — it matches ${byBasename.length} members: ${refs}. ` +
+        `Pass the full ref instead.`,
+    );
   }
+  if (byBasename.length === 1) return byBasename[0];
+
   const norm = ref.replace(/\\/g, "/").replace(/^\.?\/?sources\//, "").replace(/\/+$/, "");
   for (const m of ctx.members.values()) {
     if (m.ref === norm) return m;
@@ -126,9 +138,10 @@ export function requireSourceDataDir(ctx: CollectionContext, ref: string | undef
  * workspace is a collection of one, which is the backward-compat path. Cheap
  * filesystem walk; called on every session start.
  *
- * dataKey stays `basename(path)` so existing `data/<name>/` output dirs keep
- * resolving (nested sources sharing a basename collide — a pre-existing risk,
- * fixed with collection-scoped slugs when manifests land in Phase 2).
+ * dataKey is derived via `dataKeyForRef`: flat sources (no "/" in ref) keep the
+ * bare `basename(path)`, so existing `data/<name>/` output dirs keep resolving;
+ * nested refs are slugged via `toSlug` so two sources with the same basename
+ * under different parents still get distinct data dirs.
  */
 export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDir: string): void {
   ctx.workspaceDir = workspaceDir;
