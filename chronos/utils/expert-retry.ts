@@ -52,33 +52,95 @@ export interface RetryResult<T> {
   response: T;
   /** Total attempts made (1 = succeeded or failed without any retry). */
   attempts: number;
+  /** True when the final attempt ended because its per-attempt timeout fired. */
+  timedOut: boolean;
+}
+
+interface AttemptOutcome<T> {
+  response?: T;
+  /** Message from an attempt that threw instead of resolving. */
+  threw?: string;
+  timedOut: boolean;
 }
 
 /**
- * Run `attempt` until it succeeds, fails permanently, is aborted, or retries
- * are exhausted. `retries` counts *re*-attempts after the first try, so the
- * loop makes at most `1 + retries` calls. The last response is returned
- * as-is; the caller keeps its existing stopReason handling.
+ * Run one attempt bounded by `timeoutMs`, composed with the caller's
+ * user-cancel signal.
+ *
+ * The timeout is expressed as an ABORT, not as pi-ai's `timeoutMs` option:
+ * the Google/Vertex providers ignore `timeoutMs` entirely and honour only
+ * `signal`, so an abort is the one mechanism that works on every provider.
+ */
+async function runAttempt<T extends CompleteLike>(
+  attempt: (signal?: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  userSignal: AbortSignal | undefined,
+): Promise<AttemptOutcome<T>> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const onUserAbort = () => controller.abort();
+  userSignal?.addEventListener("abort", onUserAbort);
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs)
+      : undefined;
+  try {
+    return { response: await attempt(controller.signal), timedOut };
+  } catch (e) {
+    // Google throws `new Error("Request aborted")` when the signal is already
+    // aborted on entry, breaking pi-ai's usual resolve-with-stopReason
+    // contract. Treat a throw like a failed response so it stays retryable.
+    return { threw: e instanceof Error ? e.message : String(e), timedOut };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    userSignal?.removeEventListener("abort", onUserAbort);
+  }
+}
+
+/**
+ * Run `attempt` until it succeeds, fails permanently, is cancelled by the user,
+ * or retries are exhausted. `retries` counts *re*-attempts, so at most
+ * `1 + retries` calls are made. Each attempt is bounded by `opts.timeoutMs`
+ * (0 or omitted = unbounded).
+ *
+ * A timed-out attempt is retryable and is NOT reported as a user abort: the
+ * loop tests the user's own signal, never the composed per-attempt one.
  */
 export async function completeWithRetry<T extends CompleteLike>(
-  attempt: () => Promise<T>,
-  opts: { retries: number; delayMs?: (retryIndex: number) => number },
+  attempt: (signal?: AbortSignal) => Promise<T>,
+  opts: { retries: number; timeoutMs?: number; delayMs?: (retryIndex: number) => number },
   signal?: AbortSignal,
 ): Promise<RetryResult<T>> {
   const delayMs = opts.delayMs ?? backoffDelayMs;
+  const timeoutMs = opts.timeoutMs ?? 0;
   const maxAttempts = 1 + Math.max(0, opts.retries);
-  let response = await attempt();
+
+  let outcome = await runAttempt(attempt, timeoutMs, signal);
   let attempts = 1;
-  while (
-    attempts < maxAttempts &&
-    response.stopReason === "error" &&
-    !signal?.aborted &&
-    !isPermanentExpertError(response.errorMessage)
-  ) {
+
+  while (attempts < maxAttempts && !signal?.aborted && isRetryable(outcome)) {
     await sleepWithAbort(delayMs(attempts - 1), signal);
     if (signal?.aborted) break;
-    response = await attempt();
+    outcome = await runAttempt(attempt, timeoutMs, signal);
     attempts++;
   }
-  return { response, attempts };
+
+  return { response: finalResponse(outcome), attempts, timedOut: outcome.timedOut };
+}
+
+function isRetryable<T extends CompleteLike>(o: AttemptOutcome<T>): boolean {
+  if (o.timedOut) return true;
+  if (o.threw !== undefined) return !isPermanentExpertError(o.threw);
+  return o.response?.stopReason === "error" && !isPermanentExpertError(o.response.errorMessage);
+}
+
+// An attempt that only ever threw has no response object to return. Synthesize
+// the shape pi-ai would have produced so callers keep their stopReason handling
+// and nothing escapes as an uncaught exception.
+function finalResponse<T extends CompleteLike>(o: AttemptOutcome<T>): T {
+  if (o.response !== undefined) return o.response;
+  return { stopReason: "error", errorMessage: o.threw ?? "expert call failed" } as unknown as T;
 }
