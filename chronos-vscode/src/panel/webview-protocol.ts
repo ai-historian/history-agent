@@ -48,7 +48,10 @@ export type ExtToWebview =
   | { type: "permissionRequest"; id: string; command: string; suggestedPrefix: string }
   | { type: "yolo"; enabled: boolean }
   // workspace data
-  | { type: "sources"; sources: { name: string; pageCount: number }[] }
+  // dataKey is the agent's data-dir key for this source (basename for a flat
+  // source, a slug for a nested one) — the same identity space as currentSource,
+  // so the webview can match the dropdown selection on it directly.
+  | { type: "sources"; sources: { name: string; pageCount: number; dataKey: string }[] }
   | {
       type: "collections";
       collections: { id: string; name: string; description?: string; memberCount: number }[];

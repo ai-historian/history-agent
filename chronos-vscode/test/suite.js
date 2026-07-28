@@ -206,6 +206,43 @@ exports.run = async function run() {
   });
   check("expert drawer surfaces tool-use viewer links + flagged elevated actions", true);
 
+  // 10. Nested sources (blocker 4): the agent slugs a nested source's data key
+  //     (sources/city/Nested_1900 -> data/city--Nested_1900), but the host used
+  //     to re-derive sourceName via basename(sourceDir) whenever a citation
+  //     carried an explicit chronos_source — even one naming the already-active
+  //     source — clobbering currentSource with the raw directory basename.
+  api.chronosTest.invoke("sendPrompt", "select-nested: city/Nested_1900");
+  await waitFor("nested source active in viewer", async () => (await dump())?.currentSource === "city--Nested_1900");
+  check("agent-initiated show_page resolves the nested source to its slug", true);
+
+  const nestedDataDir = join(ws, "data", "city--Nested_1900");
+  mkdirSync(nestedDataDir, { recursive: true });
+  writeFileSync(
+    join(nestedDataDir, "citation.json"),
+    JSON.stringify(
+      [{ name: "nested row", chronos_page: 1, chronos_bbox: [0.1, 0.1, 0.4, 0.1], chronos_source: "city/Nested_1900" }],
+      null,
+      2,
+    ),
+  );
+  api.chronosTest.invoke("openDataTab");
+  await waitFor("nested data file listed", async () => (await dump())?.data?.files?.includes("citation.json"));
+  api.chronosTest.invoke("selectDataFile", "citation.json");
+  await waitFor("nested data file selected", async () => (await dump())?.data?.selected === "citation.json");
+
+  // The row cites its own (already-active) source explicitly via chronos_source
+  // — this is what drives previewSource/openViewLink down the sourcePath branch
+  // even though the cited source is already current.
+  api.chronosTest.invoke("viewFirstRow");
+  api.chronosTest.invoke("showFullPage");
+  await waitFor("citation click round-trips to the source viewer", async () => (await dump())?.viewerTab === "page");
+  const afterCitation = await dump();
+  check(
+    "citation click for a nested source resolves currentSource to the agent's data-dir slug, not basename(sourceDir)",
+    afterCitation?.currentSource === "city--Nested_1900",
+    `currentSource=${afterCitation?.currentSource}`,
+  );
+
   // Make sure the subprocess stayed alive throughout
   const after = api.getChronosStatus();
   check("pi subprocess still alive", after?.agentStatus === "ready", after?.lastError);

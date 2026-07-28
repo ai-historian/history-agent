@@ -45,7 +45,7 @@ export class ChronosApp extends LitElement {
 
   declare state: RpcSessionState | null;
   declare models: ModelInfo[];
-  declare sources: { name: string; pageCount: number }[];
+  declare sources: { name: string; pageCount: number; dataKey: string }[];
   declare sessions: ChronosSessionInfo[];
   declare drawerOpen: boolean;
   declare uiRequest: RpcExtensionUIRequest | null;
@@ -418,7 +418,7 @@ export class ChronosApp extends LitElement {
             >
               <option value="" ?selected=${!this.currentSource}>— none —</option>
               ${this.sources.map(
-                (s) => html`<option value=${s.name} ?selected=${s.name === this.currentSource || s.name.endsWith("/" + this.currentSource)}>
+                (s) => html`<option value=${s.name} ?selected=${s.dataKey === this.currentSource}>
                   ${s.name} (${s.pageCount} pp.)
                 </option>`,
               )}

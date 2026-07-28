@@ -162,6 +162,24 @@ export class ChronosPanel {
   // source resolve against the current source.
   private currentSourceDir: string | undefined;
   private currentSourceName: string | undefined;
+
+  // The agent owns the data-dir key: flat sources use basename(path), nested
+  // refs are slugged (city/X -> city--X). Rather than re-deriving it here —
+  // which would mean duplicating dataKeyForRef, toSlug AND deriveRef across a
+  // package boundary with no shared code — record the key the agent already
+  // sends on every viewer message and look it up by directory.
+  private dataKeyBySourceDir = new Map<string, string>();
+
+  private rememberDataKey(sourceDir: string, dataKey: string): void {
+    if (sourceDir && dataKey) this.dataKeyBySourceDir.set(sourceDir, dataKey);
+  }
+
+  // Falls back to basename only for a directory the agent has never named,
+  // which is the pre-existing behaviour for flat sources and correct for them.
+  private dataKeyForSourceDir(sourceDir: string): string {
+    return this.dataKeyBySourceDir.get(sourceDir) ?? basename(sourceDir);
+  }
+
   private firstPage = 1;
   private lastPage = 1;
   // Last source we pushed a data-file list for, so navigation within a source
@@ -384,7 +402,9 @@ export class ChronosPanel {
     const sources = existsSync(sourcesDir) ? discoverSources(sourcesDir) : [];
     this.post({
       type: "sources",
-      sources: sources.map((s) => ({ name: s.name, pageCount: countPages(s.path) })),
+      // dataKey lets the webview match the dropdown option against currentSource
+      // (also a data key) without re-deriving it — see dataKeyForSourceDir above.
+      sources: sources.map((s) => ({ name: s.name, pageCount: countPages(s.path), dataKey: this.dataKeyForSourceDir(s.path) })),
     });
   }
 
@@ -573,14 +593,19 @@ export class ChronosPanel {
   handleHttpMessage(msg: AgentToExtensionMessage): void {
     switch (msg.type) {
       case "show_page":
+        this.rememberDataKey(msg.sourceDir, msg.sourceName);
         this.showPage(msg.sourceDir, msg.sourceName, msg.pageId, msg.bbox, msg.totalPages);
         break;
       case "page_list":
+        this.rememberDataKey(msg.sourceDir, msg.sourceName);
         this.firstPage = msg.firstPage;
         this.lastPage = msg.lastPage;
         this.post({ type: "viewer/updateRange", firstPage: msg.firstPage, lastPage: msg.lastPage });
         break;
       case "show_text":
+        // ShowTextMessage carries only sourceName, not sourceDir (see http-client.ts)
+        // — nothing to key the cache on here; currentSourceName is already correct
+        // as sent, so this is a no-op w.r.t. the bug this cache fixes.
         this.currentSourceName = msg.sourceName;
         this.post({
           type: "viewer/showText",
@@ -658,7 +683,7 @@ export class ChronosPanel {
     let sourceName = this.currentSourceName;
     if (sourcePath) {
       sourceDir = this.resolveCitedSource(sourcePath);
-      sourceName = basename(sourceDir);
+      sourceName = this.dataKeyForSourceDir(sourceDir);
     }
     if (!sourceDir) return;
     this.post({
@@ -675,7 +700,7 @@ export class ChronosPanel {
     let sourceName = this.currentSourceName;
     if (sourcePath) {
       sourceDir = this.resolveCitedSource(sourcePath);
-      sourceName = basename(sourceDir);
+      sourceName = this.dataKeyForSourceDir(sourceDir);
     }
     if (!sourceDir || !sourceName) return;
     const totalPages = sourceDir === this.currentSourceDir ? undefined : countPages(sourceDir);
