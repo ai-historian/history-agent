@@ -135,6 +135,50 @@ function makeSource(ws, rel) {
         resolveSource(ctx, "Frankfurt_1864").path === p);
 }
 
+// --- F5: /select-source's exact-ref match must win over an ambiguous
+// basename-only match, not just whichever sorts first ----------------------
+// /select-source's own handler (chronos/extensions/index.ts) isn't exported —
+// it's registered inline via pi.registerCommand — so this exercises the exact
+// two-line precedence expression the fix changed it to
+// (`members.find(ref-match) ?? members.find(basename-match)`) against the
+// same repro the finding describes: a member "a/X" (whose basename is "X")
+// sorts before an exact member "X" itself. The OLD code
+// (`members.find(m => m.ref === requested || basename(m.path) === requested)`)
+// took whichever member satisfied EITHER condition first in sort order — here
+// that's "a/X", since it sorts first and its basename happens to match — even
+// though an exact ref "X" exists later in the list.
+{
+  const ws = workspace();
+  const exactPath = makeSource(ws, "X");
+  const nestedPath = makeSource(ws, join("a", "X"));
+  const members = [
+    { ref: "a/X", path: nestedPath },
+    { ref: "X", path: exactPath },
+  ].sort((a, b) => a.ref.localeCompare(b.ref)); // "a/X" sorts before "X"
+  check("sanity: the ambiguous member sorts first",
+        members[0].ref === "a/X", JSON.stringify(members.map((m) => m.ref)));
+
+  const requested = "X";
+  const buggyMatch = members.find((m) => m.ref === requested || basename(m.path) === requested);
+  check("demonstrates the bug: a single-pass find(ref-or-basename) picks the wrong (sorted-first) member",
+        buggyMatch?.ref === "a/X", buggyMatch?.ref);
+
+  const fixedMatch = members.find((m) => m.ref === requested) ?? members.find((m) => basename(m.path) === requested);
+  check("the fix: exact ref match wins even though the ambiguous member sorts first",
+        fixedMatch?.ref === "X", fixedMatch?.ref);
+
+  // An unambiguous basename lookup (no exact-ref collision) must still work —
+  // the fix must not regress the lenient-basename fallback into a no-match.
+  const basenameOnlyRequested = "Frankfurt_1864";
+  const frankfurtPath = makeSource(ws, join("city", "Frankfurt_1864"));
+  const membersNoCollision = [{ ref: "city/Frankfurt_1864", path: frankfurtPath }];
+  const basenameFallback =
+    membersNoCollision.find((m) => m.ref === basenameOnlyRequested) ??
+    membersNoCollision.find((m) => basename(m.path) === basenameOnlyRequested);
+  check("basename fallback still resolves when there's no exact-ref collision",
+        basenameFallback?.ref === "city/Frankfurt_1864", basenameFallback?.ref);
+}
+
 // --- Task 5: change_source additions survive a session_start ---------------
 {
   const store = await import("../dist/utils/session-collection-store.js");

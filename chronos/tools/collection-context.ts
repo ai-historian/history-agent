@@ -105,8 +105,11 @@ export function refList(ctx: CollectionContext): string {
   return refs.slice(0, REF_LIST_CAP).join(", ") + `, …and ${refs.length - REF_LIST_CAP} more`;
 }
 
-// Lenient fallback so the agent can pass the human-obvious name. Mirrors the
-// /select-source match (exact ref → basename → workspace-relative path).
+// Lenient fallback so the agent can pass the human-obvious name. Mirrors
+// /select-source's precedence (exact ref, checked by the caller via
+// ctx.members.get, then basename, then workspace-relative path) — but NOT its
+// handling of an ambiguous basename: /select-source silently takes whichever
+// sorted member matches first, while this throws.
 //
 // A bare basename shared by two members is AMBIGUOUS and must not be guessed:
 // nested sources keep distinct refs but can share a basename, and silently

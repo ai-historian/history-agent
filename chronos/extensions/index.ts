@@ -92,7 +92,13 @@ export default function (pi: ExtensionAPI) {
       let member: (typeof members)[number] | undefined;
       const requested = (args ?? "").trim();
       if (requested) {
-        member = members.find((m) => m.ref === requested || basename(m.path) === requested);
+        // Exact ref match first, THEN basename — not a single pass over both
+        // conditions. Members are sorted by ref, so a single `.find` testing
+        // `ref === requested || basename === requested` takes whichever member
+        // sorts first and happens to match either condition: given "a/X" and
+        // "X", "a/X" sorts first and its basename matches, so a bare "X" would
+        // preview the wrong document even though an exact ref "X" exists.
+        member = members.find((m) => m.ref === requested) ?? members.find((m) => basename(m.path) === requested);
         if (!member) {
           ctx.ui.notify(`Source "${requested}" not found.`, "warning");
           return;
