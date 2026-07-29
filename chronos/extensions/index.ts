@@ -26,7 +26,8 @@ import { loadToolText, loadPromptFile } from "../utils/tool-loader.js";
 import { listPageIds } from "../utils/page-files.js";
 import { ensureWorkspace } from "../utils/workspace.js";
 import { listCollections, loadCollectionInto, resolveSessionCollectionSelection } from "../utils/collection-manifest.js";
-import { saveSessionCollection, loadSessionCollection } from "../utils/session-collection-store.js";
+import { saveSessionCollection, loadSessionCollection, carryForkedSessionState } from "../utils/session-collection-store.js";
+import { sessionIdFromFile } from "../utils/session-file-id.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
 import { connectHttp, sendToExtension, disconnectHttp } from "../http/http-client.js";
@@ -250,7 +251,17 @@ export default function (pi: ExtensionAPI) {
     // session had narrowed to a named collection, re-narrow to it (falling back
     // to all sources if that manifest is gone).
     buildCollectionFromDiscovery(collectionCtx, ctx.cwd);
-    const savedCollection = loadSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId());
+    const sessionId = ctx.sessionManager.getSessionId();
+    // A fork (VS Code's "edit a past message") mints a brand-new session id —
+    // this session's sidecars (collection selection, change_source
+    // extraMembers) are empty until we copy them over from the session it
+    // forked from. previousSessionFile is a FILE PATH, not an id, so read the
+    // old session's id out of its own header first.
+    if (event.reason === "fork" && event.previousSessionFile) {
+      const previousSessionId = sessionIdFromFile(event.previousSessionFile);
+      if (previousSessionId) carryForkedSessionState(ctx.cwd, previousSessionId, sessionId);
+    }
+    const savedCollection = loadSessionCollection(ctx.cwd, sessionId);
     // Pure decision (testable without I/O): which id to attempt, and whether a
     // pre-Task-6 store (which persisted the display NAME, not the id) needs
     // migrating. The actual load is still imperative — it touches disk and
@@ -259,7 +270,7 @@ export default function (pi: ExtensionAPI) {
     if (decision.idToLoad) {
       if (loadCollectionInto(collectionCtx, ctx.cwd, decision.idToLoad)) {
         if (decision.needsRewrite) {
-          saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), decision.idToLoad);
+          saveSessionCollection(ctx.cwd, sessionId, decision.idToLoad);
         }
       } else {
         console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
@@ -270,7 +281,7 @@ export default function (pi: ExtensionAPI) {
     // Re-add out-of-tree sources added via change_source this session.
     // buildCollectionFromDiscovery above wiped them, and a named-collection
     // restore does not know about them either.
-    replayExtraMembers(collectionCtx, ctx.cwd, ctx.sessionManager.getSessionId());
+    replayExtraMembers(collectionCtx, ctx.cwd, sessionId);
     // Tell the viewer which collection is active so the picker reflects it.
     emitActiveCollection(collectionCtx);
     await restoreExperts(ctx);

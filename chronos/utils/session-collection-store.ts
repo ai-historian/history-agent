@@ -108,3 +108,27 @@ export function loadSessionExtraMembers(workspaceDir: string, sessionId: string)
   const extras = entry?.extraMembers;
   return Array.isArray(extras) ? extras.filter((p): p is string => typeof p === "string") : [];
 }
+
+/**
+ * Carry a forked session's collection selection and change_source
+ * extraMembers forward to the new session id a fork mints.
+ *
+ * pi's fork (edit-and-resend in the VS Code panel) creates a brand-new
+ * session file with a brand-new id — this store has no entry for that id yet,
+ * so without this, every change_source addition and collection narrowing from
+ * the forked-from session silently evaporates on edit-and-resend, exactly the
+ * failure this store exists to prevent for startup/switch/resume. No-op if
+ * the previous session has nothing recorded, or the ids are identical/absent.
+ *
+ * Copies (rather than only reading through to the previous session on demand)
+ * so the new id's entry is self-contained and a later fork-of-this-fork can
+ * chain off it the same way.
+ */
+export function carryForkedSessionState(workspaceDir: string, previousSessionId: string, newSessionId: string): void {
+  if (!previousSessionId || !newSessionId || previousSessionId === newSessionId) return;
+  const collection = loadSessionCollection(workspaceDir, previousSessionId);
+  if (collection !== undefined) saveSessionCollection(workspaceDir, newSessionId, collection);
+  for (const sourcePath of loadSessionExtraMembers(workspaceDir, previousSessionId)) {
+    saveSessionExtraMember(workspaceDir, newSessionId, sourcePath);
+  }
+}

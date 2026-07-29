@@ -313,6 +313,77 @@ function makeSource(ws, rel) {
         JSON.stringify(store.loadSessionExtraMembers(ws, sidObj)));
 }
 
+// --- F2: a fork carries the forked-from session's collection selection and
+// change_source extraMembers forward to the new session id -----------------
+// pi's fork (VS Code's "edit a past message") mints a brand-new session id;
+// without this, session_start's loadSessionExtraMembers/loadSessionCollection
+// calls for the NEW id find nothing, silently dropping every change_source
+// addition and collection narrowing on edit-and-resend.
+{
+  const store = await import("../dist/utils/session-collection-store.js");
+  const { sessionIdFromFile } = await import("../dist/utils/session-file-id.js");
+  const ws = workspace();
+
+  // (a) carryForkedSessionState itself.
+  store.saveSessionCollection(ws, "sess-old", "frankfurt");
+  store.saveSessionExtraMember(ws, "sess-old", "/mnt/archive/Koeln_1871");
+
+  store.carryForkedSessionState(ws, "sess-old", "sess-new");
+  check("fork carries the collection selection to the new id",
+        store.loadSessionCollection(ws, "sess-new") === "frankfurt",
+        store.loadSessionCollection(ws, "sess-new"));
+  check("fork carries extraMembers to the new id",
+        store.loadSessionExtraMembers(ws, "sess-new").includes("/mnt/archive/Koeln_1871"),
+        JSON.stringify(store.loadSessionExtraMembers(ws, "sess-new")));
+  check("the OLD session's own entry is untouched",
+        store.loadSessionCollection(ws, "sess-old") === "frankfurt" &&
+        store.loadSessionExtraMembers(ws, "sess-old").length === 1);
+
+  // A fork-of-a-fork must chain: the newest id ends up with the same state,
+  // read from the (already-carried-forward) middle id, not the original.
+  store.carryForkedSessionState(ws, "sess-new", "sess-newest");
+  check("a fork-of-a-fork also carries the state forward",
+        store.loadSessionCollection(ws, "sess-newest") === "frankfurt" &&
+        store.loadSessionExtraMembers(ws, "sess-newest").includes("/mnt/archive/Koeln_1871"));
+
+  // No-ops: nothing to carry, or degenerate ids.
+  const before = JSON.stringify(store.loadSessionExtraMembers(ws, "sess-empty-target"));
+  store.carryForkedSessionState(ws, "sess-nonexistent", "sess-empty-target");
+  check("carrying from a session with nothing recorded is a no-op",
+        JSON.stringify(store.loadSessionExtraMembers(ws, "sess-empty-target")) === before &&
+        store.loadSessionCollection(ws, "sess-empty-target") === undefined);
+  store.carryForkedSessionState(ws, "sess-old", "sess-old");
+  check("carrying onto the same id is a no-op (does not duplicate extraMembers)",
+        store.loadSessionExtraMembers(ws, "sess-old").length === 1);
+  store.carryForkedSessionState(ws, "", "sess-new");
+  store.carryForkedSessionState(ws, "sess-old", "");
+  check("an empty previous/new id does not throw and changes nothing observable", true);
+
+  // (b) sessionIdFromFile: the glue that maps previousSessionFile (a path) to
+  // the id carryForkedSessionState needs.
+  const sessionFile = join(ws, "fake-session.jsonl");
+  writeFileSync(
+    sessionFile,
+    `${JSON.stringify({ type: "session", version: 1, id: "abc-123", timestamp: "2026-01-01T00:00:00.000Z", cwd: ws })}\n` +
+      `${JSON.stringify({ type: "message", id: "m1" })}\n`,
+  );
+  check("sessionIdFromFile reads the id out of a real session header",
+        sessionIdFromFile(sessionFile) === "abc-123", sessionIdFromFile(sessionFile));
+
+  const noHeaderFile = join(ws, "no-header.jsonl");
+  writeFileSync(noHeaderFile, `${JSON.stringify({ type: "message", id: "m1" })}\n`);
+  check("sessionIdFromFile returns undefined when the first line isn't a session header",
+        sessionIdFromFile(noHeaderFile) === undefined);
+
+  check("sessionIdFromFile returns undefined for a missing file",
+        sessionIdFromFile(join(ws, "does-not-exist.jsonl")) === undefined);
+
+  const malformedFile = join(ws, "malformed.jsonl");
+  writeFileSync(malformedFile, "not json at all\n");
+  check("sessionIdFromFile returns undefined for a malformed first line",
+        sessionIdFromFile(malformedFile) === undefined);
+}
+
 // --- Task 6: a manifest whose name differs from its filename is selectable --
 {
   const { listCollections, loadCollection } = await import("../dist/utils/collection-manifest.js");
