@@ -149,10 +149,11 @@ export default function (pi: ExtensionAPI) {
         if (requested === ALL_SOURCES || requested.toLowerCase() === "all") {
           chosen = null;
         } else {
-          // Match the id first (the stable identity) and fall back to the
-          // display name for backward compatibility with anything a user
-          // already typed/scripted against the old name-as-id behavior.
-          const found = collections.find((c) => c.id === requested) ?? collections.find((c) => c.name === requested);
+          // Match on id only — id is the stable identity. A display-name
+          // fallback here would be actively dangerous: a requested value that
+          // happens to equal a DIFFERENT collection's display name would
+          // silently resolve to the wrong collection (see Item B).
+          const found = collections.find((c) => c.id === requested);
           if (!found) {
             ctx.ui.notify(`Collection "${requested}" not found.`, "warning");
             return;
@@ -268,17 +269,13 @@ export default function (pi: ExtensionAPI) {
       if (previousSessionId) carryForkedSessionState(ctx.cwd, previousSessionId, sessionId);
     }
     const savedCollection = loadSessionCollection(ctx.cwd, sessionId);
-    // Pure decision (testable without I/O): which id to attempt, and whether a
-    // pre-Task-6 store (which persisted the display NAME, not the id) needs
-    // migrating. The actual load is still imperative — it touches disk and
-    // mutates collectionCtx.
+    // Pure decision (testable without I/O) on which id to attempt, matched by
+    // id only — see resolveSessionCollectionSelection's docblock for why a
+    // display-name fallback/migration is deliberately absent. The actual load
+    // is still imperative — it touches disk and mutates collectionCtx.
     const decision = resolveSessionCollectionSelection(savedCollection, listCollections(ctx.cwd));
     if (decision.idToLoad) {
-      if (loadCollectionInto(collectionCtx, ctx.cwd, decision.idToLoad)) {
-        if (decision.needsRewrite) {
-          saveSessionCollection(ctx.cwd, sessionId, decision.idToLoad);
-        }
-      } else {
+      if (!loadCollectionInto(collectionCtx, ctx.cwd, decision.idToLoad)) {
         console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
       }
     } else if (savedCollection) {

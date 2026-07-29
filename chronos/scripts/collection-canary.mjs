@@ -586,10 +586,17 @@ function makeSource(ws, rel) {
   }
 }
 
-// --- R18/optional: resolveSessionCollectionSelection is the pure decision
-// extracted from session_start's migration branch — no I/O, no mutation, so
-// it can cover the highest-risk new logic (session-restore migration)
-// directly instead of only through the end-to-end UI test. -----------------
+// --- R18: resolveSessionCollectionSelection is the pure decision extracted
+// from session_start — no I/O, no mutation, so it can cover the
+// session-restore logic directly instead of only through the end-to-end UI
+// test. ----------------------------------------------------------------
+// Item B removed the display-name migration this used to have: collections
+// have never shipped (zero collection files exist on dev/master), so the
+// migration guarded a population of zero, and it was the sole cause of a
+// real hazard — a stored value that happens to equal a DIFFERENT
+// collection's display name would silently resolve to the wrong collection.
+// The last check below is that exact hazard, asserted fixed: it MUST stay on
+// the auto-collection, not silently resolve to "frankfurt".
 {
   const { resolveSessionCollectionSelection } = await import("../dist/utils/collection-manifest.js");
   const collections = [
@@ -599,23 +606,28 @@ function makeSource(ws, rel) {
 
   check("no stored selection -> stay on auto-collection",
         JSON.stringify(resolveSessionCollectionSelection(undefined, collections)) ===
-        JSON.stringify({ idToLoad: null, needsRewrite: false }));
+        JSON.stringify({ idToLoad: null }));
 
-  check("stored id matches directly -> no rewrite",
+  check("stored id matches directly -> load it",
         JSON.stringify(resolveSessionCollectionSelection("frankfurt", collections)) ===
-        JSON.stringify({ idToLoad: "frankfurt", needsRewrite: false }));
+        JSON.stringify({ idToLoad: "frankfurt" }));
 
-  check("stored legacy display name -> migrates to id, needs rewrite",
-        JSON.stringify(resolveSessionCollectionSelection("Frankfurt Directories", collections)) ===
-        JSON.stringify({ idToLoad: "frankfurt", needsRewrite: true }));
-
-  check("stored value matching neither id nor name -> stay on auto-collection",
+  check("stored value matching neither id nor any name -> stay on auto-collection",
         JSON.stringify(resolveSessionCollectionSelection("nonexistent", collections)) ===
-        JSON.stringify({ idToLoad: null, needsRewrite: false }));
+        JSON.stringify({ idToLoad: null }));
 
-  check("id is checked before name (id/name collision resolves to direct id match)",
+  check("an id/name collision resolves to the direct id match",
         JSON.stringify(resolveSessionCollectionSelection("mainz", collections)) ===
-        JSON.stringify({ idToLoad: "mainz", needsRewrite: false }));
+        JSON.stringify({ idToLoad: "mainz" }));
+
+  // THE HAZARD Item B removes: a stored value equal to a DIFFERENT
+  // collection's display name (not its own id) must NOT resolve to that
+  // collection — only a direct id match may. Before Item B, the deleted
+  // migration fallback would have matched this against c.name and silently
+  // loaded "frankfurt".
+  check("a stored value matching only a display name (not any id) does not resolve — stays on auto-collection",
+        JSON.stringify(resolveSessionCollectionSelection("Frankfurt Directories", collections)) ===
+        JSON.stringify({ idToLoad: null }));
 }
 
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);

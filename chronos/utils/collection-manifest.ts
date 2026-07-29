@@ -114,9 +114,6 @@ export interface SessionCollectionDecision {
   /** The id to attempt loading via `loadCollectionInto`; null = stay on the
    *  auto "all sources" collection (nothing stored, or nothing matched). */
   idToLoad: string | null;
-  /** True when the caller should persist `idToLoad` back to the session
-   *  store — a legacy display-name selection was migrated to its id. */
-  needsRewrite: boolean;
 }
 
 /**
@@ -125,29 +122,26 @@ export interface SessionCollectionDecision {
  * mutation; safe to unit-test without a filesystem.
  *
  * - No stored selection -> stay on the auto-collection.
- * - Stored value matches a collection's `id` directly -> load it as-is.
- * - Stored value matches a collection's `name` instead (pre-Task-6 session
- *   stores persisted the display name, not the id) -> load by id and flag a
- *   rewrite so the store gets migrated once.
- * - No match at all (manifest deleted/renamed since selection) -> stay on
- *   the auto-collection.
+ * - Stored value matches a collection's `id` -> load it.
+ * - No match (manifest deleted/renamed since selection) -> stay on the
+ *   auto-collection.
  *
- * `id` is checked before `name` so a collection whose `id` happens to equal
- * another collection's `name` still resolves to the direct id match, same as
- * the imperative "try loadCollectionInto(savedCollection) first" order this
- * replaces.
+ * Matches on `id` ONLY, deliberately — collections have never shipped (no
+ * collection files exist on `dev`/`master`), so there is no population of
+ * pre-existing sessions to migrate from a display-name selection, and a
+ * display-name fallback here is actively dangerous: a stored value that
+ * happens to equal a DIFFERENT collection's display name would silently
+ * resolve to the wrong collection, which is strictly worse than the safe
+ * "stay on auto-collection" fallback below. This used to also fall back to
+ * `name` and report `needsRewrite` for a one-time store migration; both were
+ * deleted along with that hazard (see Item B in the branch's final review).
  */
 export function resolveSessionCollectionSelection(
   savedCollection: string | undefined,
-  collections: Pick<CollectionSummary, "id" | "name">[],
+  collections: Pick<CollectionSummary, "id">[],
 ): SessionCollectionDecision {
-  if (!savedCollection) return { idToLoad: null, needsRewrite: false };
-  if (collections.some((c) => c.id === savedCollection)) {
-    return { idToLoad: savedCollection, needsRewrite: false };
-  }
-  const migrated = collections.find((c) => c.name === savedCollection);
-  if (migrated) return { idToLoad: migrated.id, needsRewrite: true };
-  return { idToLoad: null, needsRewrite: false };
+  if (!savedCollection) return { idToLoad: null };
+  return { idToLoad: collections.some((c) => c.id === savedCollection) ? savedCollection : null };
 }
 
 /**
