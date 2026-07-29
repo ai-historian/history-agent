@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExpertRegistry } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
-import { requireSourceDataDir, resolveSource } from "./collection-context.js";
+import { requireSourceDataDir, resolveSource, effectiveSourceRef } from "./collection-context.js";
 import { runExpertTurn, confirmExpertGrant } from "./expert-turn.js";
 import { resolveImagePath, resolveOutputFile, type ExpertCapability } from "./expert-tools.js";
 
@@ -87,23 +87,15 @@ const taskParams = Type.Object({
 
 /**
  * The source in effect this call: an explicit `source` wins; otherwise a
- * task_id follow-up inherits the session's remembered source (mirroring
- * expert-turn.ts's `effectiveSource`). Shared by outputBaseDir and
- * effectiveSourceRel so this precedence rule lives in exactly one place —
- * each function keeps its own "no source at all" fallback and ref
- * resolution local, since those genuinely differ (ctx.workspaceDir vs "").
+ * task_id follow-up inherits the session's remembered source.
+ *
+ * The rule itself lives in collection-context's `effectiveSourceRef`, which
+ * expert-turn.ts calls too, so the two CANNOT drift apart — they did once, while
+ * the comments here claimed they couldn't. Only the "no source at all" fallback
+ * and ref resolution stay local to outputBaseDir / effectiveSourceRel, since
+ * those genuinely differ (ctx.workspaceDir vs "").
  */
-function effectiveRef(
-  explicitSource: string | undefined,
-  inheritedSource: string | undefined,
-): string | undefined {
-  // `||`, not `??`: an explicit `source: ""` must fall through to the
-  // inherited source too, not just null/undefined. `??` only falls through on
-  // null/undefined, so `source: ""` would be treated as "no source at all"
-  // and IGNORE an inherited source, writing output_file/details.source to the
-  // workspace root instead of the source the follow-up is actually viewing.
-  return explicitSource || inheritedSource;
-}
+const effectiveRef = effectiveSourceRef;
 
 /**
  * Resolve `ref` via `resolve`, or "" if it throws.

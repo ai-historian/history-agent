@@ -11,6 +11,7 @@ import {
   collectionDataDir,
   collectionMemoryPath,
   replayExtraMembers,
+  pickMemberByRequest,
   type CollectionContext,
 } from "../tools/collection-context.js";
 import { createListPagesTool } from "../tools/list-pages.js";
@@ -27,7 +28,7 @@ import { listPageIds } from "../utils/page-files.js";
 import { ensureWorkspace } from "../utils/workspace.js";
 import { listCollections, loadCollectionInto, resolveSessionCollectionSelection } from "../utils/collection-manifest.js";
 import { saveSessionCollection, loadSessionCollection, carryForkedSessionState } from "../utils/session-collection-store.js";
-import { sessionIdFromFile } from "../utils/session-file-id.js";
+import { sessionIdFromFile, forkedPreviousSessionFile } from "../utils/session-file-id.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
 import { connectHttp, sendToExtension, disconnectHttp } from "../http/http-client.js";
@@ -92,13 +93,10 @@ export default function (pi: ExtensionAPI) {
       let member: (typeof members)[number] | undefined;
       const requested = (args ?? "").trim();
       if (requested) {
-        // Exact ref match first, THEN basename — not a single pass over both
-        // conditions. Members are sorted by ref, so a single `.find` testing
-        // `ref === requested || basename === requested` takes whichever member
-        // sorts first and happens to match either condition: given "a/X" and
-        // "X", "a/X" sorts first and its basename matches, so a bare "X" would
-        // preview the wrong document even though an exact ref "X" exists.
-        member = members.find((m) => m.ref === requested) ?? members.find((m) => basename(m.path) === requested);
+        // Exact ref beats basename — see pickMemberByRequest, which owns this
+        // precedence so the canary can exercise the shipped code rather than a
+        // retyped copy of it.
+        member = pickMemberByRequest(members, requested);
         if (!member) {
           ctx.ui.notify(`Source "${requested}" not found.`, "warning");
           return;
@@ -264,9 +262,15 @@ export default function (pi: ExtensionAPI) {
     // extraMembers) are empty until we copy them over from the session it
     // forked from. previousSessionFile is a FILE PATH, not an id, so read the
     // old session's id out of its own header first.
-    if (event.reason === "fork" && event.previousSessionFile) {
-      const previousSessionId = sessionIdFromFile(event.previousSessionFile);
+    const forkedFrom = forkedPreviousSessionFile(event);
+    if (forkedFrom) {
+      const previousSessionId = sessionIdFromFile(forkedFrom);
       if (previousSessionId) carryForkedSessionState(ctx.cwd, previousSessionId, sessionId);
+      // pi defers creating a session file until the first assistant response, so a
+      // fork taken before one lands has nothing to read. Never silent — this is the
+      // one shape where the carry no-ops and the user just sees their added sources
+      // gone.
+      else console.warn(`[chronos] fork: could not read a session id from ${forkedFrom} — not carrying state forward.`);
     }
     const savedCollection = loadSessionCollection(ctx.cwd, sessionId);
     // Pure decision (testable without I/O) on which id to attempt, matched by

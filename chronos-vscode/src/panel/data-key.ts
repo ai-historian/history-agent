@@ -18,17 +18,24 @@
  * Kept dependency-free (no `vscode` import) so it can be compiled and run
  * standalone by that test.
  */
-import { basename, isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 
 /** Mirrors chronos/utils/source-discovery.ts's toSlug. */
 export function toSlug(rel: string): string {
   return rel.replace(/[\\/]/g, "--").replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
+/** Mirrors chronos/tools/collection-context.ts's refFromRelative. Translates the
+ *  PLATFORM separator only — on POSIX a backslash is a legal filename character,
+ *  and folding it would collide a dir named `city\Nested` with `city/Nested`. */
+export function refFromRelative(rel: string, pathSep: string = sep): string {
+  return rel.split(pathSep).join("/");
+}
+
 /** Mirrors chronos/tools/collection-context.ts's deriveRef. */
 export function deriveRef(workspaceDir: string, sourcePath: string): string {
   const rel = relative(join(workspaceDir, "sources"), sourcePath);
-  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel.replace(/\\/g, "/") : basename(sourcePath);
+  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? refFromRelative(rel) : basename(sourcePath);
 }
 
 /** Mirrors chronos/tools/collection-context.ts's dataKeyForRef. */

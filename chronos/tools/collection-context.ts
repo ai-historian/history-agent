@@ -11,7 +11,7 @@
  * session start) so tools that closed over it always see the live catalog.
  */
 import { existsSync } from "node:fs";
-import { basename, isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { discoverSources, toSlug } from "../utils/source-discovery.js";
 import { loadSessionExtraMembers } from "../utils/session-collection-store.js";
 
@@ -50,14 +50,60 @@ export function createCollectionContext(
 }
 
 /**
+ * The source ref in effect for a turn: an explicit `source` overrides, otherwise
+ * a follow-up inherits its expert session's remembered source.
+ *
+ * `||`, not `??`: an explicit `source: ""` means "none given" and must fall
+ * through to the inherited source. With `??` it was treated as "no source at
+ * all", so a follow-up passing `source: ""` silently targeted the workspace root.
+ *
+ * ONE exported function rather than the rule spelled out at each site: it lived
+ * in two places (view-page.ts's output-path resolution and expert-turn.ts's
+ * decision about what the expert may view), they were fixed at different times,
+ * and for one commit they DISAGREED — `source: ""` on a follow-up resolved an
+ * output dir from the inherited source while the expert turn itself failed with
+ * "page_id requires a source", contradicting the docblocks that promised the two
+ * could never diverge.
+ */
+export function effectiveSourceRef(
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string | undefined {
+  return explicitSource || inheritedSource;
+}
+
+/**
+ * Rewrite a workspace-relative path to a ref by replacing the PLATFORM's path
+ * separator with "/", so a nested source gets the same ref on win32 (where
+ * `relative()` returns `city\Nested_1900`) as on POSIX.
+ *
+ * Only `sep` is translated, never `\` unconditionally: on POSIX a backslash is
+ * a LEGAL FILENAME CHARACTER, so a directory really named `city\Nested` is one
+ * component, not two. Translating it there would fold that directory onto the
+ * ref of a genuinely nested `city/Nested` and — since `members` is keyed by ref
+ * — silently drop one of the two sources from the catalog.
+ *
+ * `pathSep` is injectable so both packages' win32 behaviour is testable from a
+ * POSIX host; production callers always use the platform `sep`.
+ */
+export function refFromRelative(rel: string, pathSep: string = sep): string {
+  return rel.split(pathSep).join("/");
+}
+
+/**
  * Derive a member ref from a source path. For a path under the workspace's
  * `sources/` tree this equals the discovery name (workspace-relative, forward
  * slashes); otherwise the basename. Shared by discovery, change_source, and
  * manifest loading so refs never diverge across call sites.
+ *
+ * Caveat: a manifest MAY supply an explicit `ref` (see collection-manifest.ts),
+ * which bypasses this function entirely and is therefore NOT normalized — the
+ * one input shape where the agent and the host can still disagree on a source's
+ * data key. Collections have never shipped, so it is unreachable today.
  */
 export function deriveRef(workspaceDir: string, sourcePath: string): string {
   const rel = relative(join(workspaceDir, "sources"), sourcePath);
-  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel.replace(/\\/g, "/") : basename(sourcePath);
+  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? refFromRelative(rel) : basename(sourcePath);
 }
 
 /**
@@ -105,10 +151,31 @@ export function refList(ctx: CollectionContext): string {
   return refs.slice(0, REF_LIST_CAP).join(", ") + `, …and ${refs.length - REF_LIST_CAP} more`;
 }
 
+/**
+ * /select-source's member lookup: an exact ref ALWAYS wins over a basename match.
+ *
+ * Two passes, not one predicate — `find(m => m.ref === r || basename(m.path) === r)`
+ * returns whichever member sorts first and matches EITHER condition, so given
+ * members "a/X" and "X", a bare "X" previewed "a/X": the wrong document, even
+ * though an exact ref "X" existed.
+ *
+ * Exported so the command handler and its canary exercise the same code. It
+ * previously lived inline in the pi entrypoint's closure, which left the shipped
+ * precedence untestable — the canary retyped the expression and asserted about
+ * its own copy, staying green when the real fix was reverted.
+ *
+ * Like /select-source before it, this still resolves an AMBIGUOUS basename to the
+ * first sorted match rather than throwing the way resolveByAlias does. That
+ * divergence is deliberate and documented, not closed here.
+ */
+export function pickMemberByRequest(members: CollectionMember[], requested: string): CollectionMember | undefined {
+  return members.find((m) => m.ref === requested) ?? members.find((m) => basename(m.path) === requested);
+}
+
 // Lenient fallback so the agent can pass the human-obvious name. Mirrors
-// /select-source's precedence (exact ref, checked by the caller via
+// pickMemberByRequest's precedence (exact ref, checked by the caller via
 // ctx.members.get, then basename, then workspace-relative path) — but NOT its
-// handling of an ambiguous basename: /select-source silently takes whichever
+// handling of an ambiguous basename: pickMemberByRequest silently takes whichever
 // sorted member matches first, while this throws.
 //
 // A bare basename shared by two members is AMBIGUOUS and must not be guessed:
@@ -126,7 +193,12 @@ function resolveByAlias(ctx: CollectionContext, ref: string): CollectionMember |
   }
   if (byBasename.length === 1) return byBasename[0];
 
-  const norm = ref.replace(/\\/g, "/").replace(/^\.?\/?sources\//, "").replace(/\/+$/, "");
+  // refFromRelative, not a blanket backslash strip: folding `\` on POSIX made
+  // `sources/weird\Name_1900` — a real one-component directory name — resolve to a
+  // genuinely nested `weird/Name_1900`, i.e. the WRONG DOCUMENT, silently. Same bug
+  // class as the deriveRef regression, and this is the path the lenient fallback
+  // invites by accepting a `sources/` prefix.
+  const norm = refFromRelative(ref).replace(/^\.?\/?sources\//, "").replace(/\/+$/, "");
   for (const m of ctx.members.values()) {
     if (m.ref === norm) return m;
   }
@@ -171,12 +243,15 @@ export function requireSourceDataDir(ctx: CollectionContext, ref: string | undef
  * recognizes the slugged-nested case via a forward slash. Using the bare name
  * there would make `dataKeyForRef` silently fall through to `basename(path)`
  * on win32, so two differently-nested sources sharing a basename would collide
- * on the same `data/` dir. `deriveRef` recomputes the same relative path but
- * always normalizes `\` to `/` before returning, so it's the single place this
- * normalization lives — every other ref-deriving call site (`replayExtraMembers`,
- * `change_source`, manifest loading) already goes through it; routing discovery
- * through it too means all four call sites can never disagree on what a given
- * source's ref is, on any platform.
+ * on the same `data/` dir. `deriveRef` recomputes the same relative path and
+ * normalizes the PLATFORM separator to `/` (see `refFromRelative` — a POSIX
+ * backslash is a legal filename character and is deliberately left alone, since
+ * folding it silently dropped one of two such sources from this very Map), so
+ * it's the single place this normalization lives. Every other ref-deriving call
+ * site (`replayExtraMembers`, `change_source`) already goes through it, so
+ * routing discovery through it too means those call sites cannot disagree about
+ * a given source's ref on any platform. Manifest loading is the exception: an
+ * explicit `mm.ref` bypasses `deriveRef` and is NOT normalized.
  */
 export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDir: string): void {
   ctx.workspaceDir = workspaceDir;
@@ -203,13 +278,32 @@ export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDi
  * a path whose png/ dir is gone, and a ref already present in the catalog.
  */
 export function replayExtraMembers(ctx: CollectionContext, workspaceDir: string, sessionId: string): void {
-  for (const sourcePath of loadSessionExtraMembers(workspaceDir, sessionId)) {
+  for (const storedPath of loadSessionExtraMembers(workspaceDir, sessionId)) {
+    // resolve() to match change_source's own normalization — the `existing.path`
+    // comparison below is a string compare, so a sidecar entry written before that
+    // normalization existed (trailing slash, `/.`) would otherwise look like a
+    // different directory and warn that a source is "unreachable" because of itself.
+    const sourcePath = resolve(storedPath);
     if (!existsSync(join(sourcePath, "png"))) {
       console.warn(`[chronos] added source no longer has png/, skipping: ${sourcePath}`);
       continue;
     }
     const ref = deriveRef(workspaceDir, sourcePath);
-    if (ctx.members.has(ref)) continue;
+    const existing = ctx.members.get(ref);
+    if (existing) {
+      // Same path = a genuine idempotent replay, nothing to say. A DIFFERENT path
+      // means this added source is unreachable this session because an in-tree
+      // source owns its ref (change_source now refuses such an add up front, but a
+      // sidecar written before that guard existed, or an in-tree dir created since,
+      // can still land here). Never silent: the agent would otherwise operate on
+      // the other document believing it had this one.
+      if (existing.path !== sourcePath) {
+        console.warn(
+          `[chronos] added source ${sourcePath} is unreachable: its ref "${ref}" is already taken by ${existing.path}. Skipping.`,
+        );
+      }
+      continue;
+    }
     ctx.members.set(ref, {
       ref,
       path: sourcePath,

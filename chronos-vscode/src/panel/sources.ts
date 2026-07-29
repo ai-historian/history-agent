@@ -1,5 +1,6 @@
 import { readdirSync, statSync, existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { refFromRelative } from "./data-key.js";
 
 export interface SourceInfo {
   name: string;
@@ -72,7 +73,10 @@ export function discoverSources(rootDir: string): SourceInfo[] {
       // deriveRef), and /select-source compares `name` against that ref verbatim
       // (chronos-panel.ts sends `msg.name` straight through as the ref argument).
       // Without this, a nested source's name would never match its ref on win32.
-      sources.push({ name: relative(rootDir, dir).replace(/\\/g, "/"), path: dir });
+      // Uses the shared helper rather than a third copy of the transform, and
+      // translates only the platform separator — a POSIX dir named `city\Nested`
+      // is ONE component and must keep its backslash.
+      sources.push({ name: refFromRelative(relative(rootDir, dir)), path: dir });
       return;
     }
 

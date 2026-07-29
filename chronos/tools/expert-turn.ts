@@ -12,7 +12,7 @@ import { pageIdToPath } from "../utils/page-files.js";
 import type { ExpertRegistry, ExpertSession } from "./expert-registry.js";
 import { newTaskId } from "./expert-registry.js";
 import type { CollectionContext } from "./collection-context.js";
-import { resolveSource, deriveRef } from "./collection-context.js";
+import { resolveSource, deriveRef, effectiveSourceRef } from "./collection-context.js";
 import { resolveExpertModel } from "../utils/resolve-model.js";
 import { cropImageToBuffer, downscaleToLimit, loadImageAsPng, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
@@ -237,9 +237,10 @@ export async function runExpertTurn(
     }
   }
 
-  // The source in effect this turn: an explicit `source` overrides; otherwise a
-  // follow-up inherits the session's remembered source.
-  const effectiveSource = input.source ?? session?.sourceRef;
+  // The source in effect this turn — the SAME shared rule view-page.ts uses to
+  // resolve output paths, so the two can no longer disagree about what an empty
+  // `source` on a follow-up means (they did, for one commit).
+  const effectiveSource = effectiveSourceRef(input.source, session?.sourceRef);
 
   if (input.pageId !== undefined && !effectiveSource) {
     return { ok: false, taskId, error: "page_id requires a source." };

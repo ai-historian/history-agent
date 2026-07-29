@@ -69,9 +69,14 @@ const hostModule = await import(
 const { deriveDataKeyFallback: hostDeriveDataKeyFallback } = hostModule;
 
 // ── compile the host's real discoverSources (sources.ts), same technique ───
+// bundle: true, unlike data-key.ts above: sources.ts imports refFromRelative from
+// ./data-key.js (deliberately — one copy of the separator normalization, not a
+// third), and a bare compile leaves that relative specifier unresolvable from the
+// data: URL this is imported through. Bundling inlines it; node builtins stay
+// external under platform: "node".
 const builtSources = await esbuild.build({
   entryPoints: [hostSourcesSrc],
-  bundle: false,
+  bundle: true,
   write: false,
   format: "esm",
   platform: "node",
@@ -182,6 +187,46 @@ for (const { label, sourceDir } of cases) {
         `name=${nested?.name} agentRef=${nested ? agentDeriveRef(realWs, nested.path) : undefined}`);
   check("discovered name has no raw path separator character other than the canonical forward slash",
         !nested || !nested.name.includes("\\"), nested?.name);
+}
+
+// ── the win32 separator branch, which a POSIX host cannot reach via the FS ──
+// This is the half of the nested-source fix that lives on the HOST, and it had
+// NO coverage: on Linux `relative()` never emits a backslash, so deleting the
+// host's normalization left every check above green. Both packages now expose
+// refFromRelative with an injectable separator precisely so the win32 branch is
+// executable here — and so the two are compared on it, not just on POSIX input.
+{
+  const { refFromRelative: agentRefFromRelative } = agent;
+  const { refFromRelative: hostRefFromRelative } = hostModule;
+
+  check("host exposes refFromRelative (the shared separator normalization)",
+        typeof hostRefFromRelative === "function", typeof hostRefFromRelative);
+  check("agent exposes refFromRelative",
+        typeof agentRefFromRelative === "function", typeof agentRefFromRelative);
+
+  if (typeof hostRefFromRelative === "function" && typeof agentRefFromRelative === "function") {
+    const cases = [
+      ["city\\Nested_1900", "\\", "city/Nested_1900", "win32 nested source"],
+      ["a\\b\\c\\D_1900", "\\", "a/b/c/D_1900", "win32 deeply nested"],
+      ["Flat_1864", "\\", "Flat_1864", "win32 flat source"],
+      ["city/Nested_1900", "/", "city/Nested_1900", "posix nested source"],
+      // The regression guard: on POSIX a backslash is a legal FILENAME character,
+      // so it must survive — folding it collided a dir named `city\Nested` with a
+      // genuinely nested `city/Nested` and silently dropped one of them.
+      ["city\\Nested_1900", "/", "city\\Nested_1900", "posix literal backslash is preserved"],
+    ];
+    for (const [rel, pathSep, expected, label] of cases) {
+      const a = agentRefFromRelative(rel, pathSep);
+      const h = hostRefFromRelative(rel, pathSep);
+      check(`${label}: agent and host agree`, a === h, `agent=${a} host=${h}`);
+      check(`${label}: result is ${JSON.stringify(expected)}`, a === expected, a);
+    }
+
+    // The property that actually matters: a nested source gets ONE ref regardless
+    // of which platform derived it.
+    check("a nested source's ref is platform-independent (win32 sep == posix sep)",
+          hostRefFromRelative("city\\Nested_1900", "\\") === hostRefFromRelative("city/Nested_1900", "/"));
+  }
 }
 
 for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });

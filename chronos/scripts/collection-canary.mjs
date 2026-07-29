@@ -525,31 +525,60 @@ function makeSource(ws, rel) {
   const { deriveRef, dataKeyForRef, buildCollectionFromDiscovery, createCollectionContext: makeCtx } =
     await import("../dist/tools/collection-context.js");
 
-  // (a) A REAL, unmocked run of the actual (compiled) buildCollectionFromDiscovery
-  // against a directory whose name is a single path component that happens to
-  // contain a literal backslash character (legal on POSIX filesystems). This
-  // is not synthetic: discoverSources really walks it and really returns a
-  // `name`/`s.path` containing that raw backslash byte — the exact shape
-  // `relative()` produces for a NESTED source on an actual win32 host, so it
-  // exercises the true production call chain (discoverSources ->
-  // buildCollectionFromDiscovery -> dataKeyForRef), just via an unusual
-  // filename instead of an unavailable OS.
+  // (a) On POSIX a backslash is a LEGAL FILENAME CHARACTER, so a directory named
+  // `weird\Name_1900` is ONE path component — not a nested source. An earlier fix
+  // normalized `\` unconditionally, which folded such a directory onto the ref of a
+  // genuinely nested `weird/Name_1900`; because `members` is keyed by ref, one of
+  // the two sources then SILENTLY VANISHED from the catalog. These run the real
+  // compiled discoverSources -> buildCollectionFromDiscovery chain over both
+  // directories at once, which is the only way the collapse is observable.
   {
     const ws = workspace();
-    const weirdPath = makeSource(ws, "weird\\Name_1900");
+    const literalBackslash = makeSource(ws, "weird\\Name_1900"); // one component
+    const genuinelyNested = makeSource(ws, "weird/Name_1900"); // two components
     const ctx = makeCtx();
     buildCollectionFromDiscovery(ctx, ws);
 
-    const expectedRef = deriveRef(ws, weirdPath);
-    check("a discovery name containing a literal backslash is normalized to deriveRef's ref",
-          ctx.members.has(expectedRef), `members=${JSON.stringify([...ctx.members.keys()])} expected=${expectedRef}`);
-    check("no member ref retains a raw backslash",
-          [...ctx.members.keys()].every((ref) => !ref.includes("\\")),
-          JSON.stringify([...ctx.members.keys()]));
-    const member = ctx.members.get(expectedRef);
-    check("its dataDir is slugged, not a raw-backslash directory name",
-          member && !basename(member.dataDir).includes("\\"),
-          member ? basename(member.dataDir) : "no member");
+    check("two dirs whose names differ only by separator-vs-literal-backslash stay TWO members",
+          ctx.members.size === 2, `size=${ctx.members.size} members=${JSON.stringify([...ctx.members.keys()])}`);
+    check("a literal backslash in a POSIX dir name is PRESERVED in its ref (it is not a separator)",
+          ctx.members.has("weird\\Name_1900"), JSON.stringify([...ctx.members.keys()]));
+    check("the genuinely nested dir still gets the forward-slash ref",
+          ctx.members.has("weird/Name_1900"), JSON.stringify([...ctx.members.keys()]));
+    check("neither source was dropped from the catalog",
+          [literalBackslash, genuinelyNested].every((p) => [...ctx.members.values()].some((m) => m.path === p)),
+          JSON.stringify([...ctx.members.values()].map((m) => m.path)));
+    check("the two sources do NOT share one data dir",
+          new Set([...ctx.members.values()].map((m) => m.dataDir)).size === 2,
+          JSON.stringify([...ctx.members.values()].map((m) => basename(m.dataDir))));
+    // deriveRef agrees with what discovery actually keyed them under.
+    check("deriveRef matches the catalog for the literal-backslash dir",
+          deriveRef(ws, literalBackslash) === "weird\\Name_1900", deriveRef(ws, literalBackslash));
+    check("deriveRef matches the catalog for the nested dir",
+          deriveRef(ws, genuinelyNested) === "weird/Name_1900", deriveRef(ws, genuinelyNested));
+  }
+
+  // (a2) win32 separator handling, which is what a POSIX host genuinely cannot
+  // reproduce through the filesystem. refFromRelative takes the separator as a
+  // parameter precisely so the win32 branch is executable here: a nested source's
+  // `relative()` output on win32 is backslash-joined and MUST become the same ref
+  // it gets on POSIX, or /select-source stops matching and the data key falls back
+  // to the basename (the original nested-source blocker).
+  {
+    const { refFromRelative } = await import("../dist/tools/collection-context.js");
+    check("win32: a backslash-joined relative path becomes the canonical forward-slash ref",
+          refFromRelative("city\\Nested_1900", "\\") === "city/Nested_1900",
+          refFromRelative("city\\Nested_1900", "\\"));
+    check("win32: a deeply nested path normalizes every separator",
+          refFromRelative("a\\b\\c\\D_1900", "\\") === "a/b/c/D_1900", refFromRelative("a\\b\\c\\D_1900", "\\"));
+    check("posix: the same input is left ALONE (backslash is a filename char there)",
+          refFromRelative("city\\Nested_1900", "/") === "city\\Nested_1900",
+          refFromRelative("city\\Nested_1900", "/"));
+    check("posix: a real nested path is unchanged",
+          refFromRelative("city/Nested_1900", "/") === "city/Nested_1900", refFromRelative("city/Nested_1900", "/"));
+    check("win32 and posix agree on a nested path once each uses its own separator",
+          refFromRelative("city\\Nested_1900", "\\") === refFromRelative("city/Nested_1900", "/"),
+          `${refFromRelative("city\\Nested_1900", "\\")} vs ${refFromRelative("city/Nested_1900", "/")}`);
   }
 
   // (b) The consequence this exists to prevent: two ACTUALLY nested, actually
@@ -628,6 +657,221 @@ function makeSource(ws, rel) {
   check("a stored value matching only a display name (not any id) does not resolve — stays on auto-collection",
         JSON.stringify(resolveSessionCollectionSelection("Frankfurt Directories", collections)) ===
         JSON.stringify({ idToLoad: null }));
+}
+
+// --- the shared explicit-vs-inherited source rule ---------------------------
+// view-page.ts (output paths) and expert-turn.ts (what the expert may view) both
+// call this ONE function now. They used to spell the rule out separately, were
+// fixed at different times, and for one commit disagreed: `source: ""` on a
+// follow-up resolved an output dir from the inherited source while the expert turn
+// itself failed with "page_id requires a source".
+{
+  const { effectiveSourceRef } = await import("../dist/tools/collection-context.js");
+
+  check('an explicit source wins over the inherited one',
+        effectiveSourceRef("Mainz_1871", "Frankfurt_1864") === "Mainz_1871");
+  check('an omitted source (undefined) inherits',
+        effectiveSourceRef(undefined, "Frankfurt_1864") === "Frankfurt_1864");
+  check('an EMPTY-STRING source inherits too — "" means "none given", not "no source at all"',
+        effectiveSourceRef("", "Frankfurt_1864") === "Frankfurt_1864",
+        String(effectiveSourceRef("", "Frankfurt_1864")));
+  check("nothing explicit and nothing inherited stays undefined (a genuine plain task)",
+        effectiveSourceRef(undefined, undefined) === undefined);
+  check('"" with nothing to inherit is still falsy, so callers take their no-source path',
+        !effectiveSourceRef("", undefined));
+
+  // The regression this guards: expert-turn.ts's own resolution must agree. Its
+  // decision is inside runExpertTurn (needs a live model), so assert the property
+  // that made them diverge — both consult the SAME function.
+  const viewPage = await import("../dist/tools/view-page.js");
+  const ctxForOutput = { workspaceDir: "/ws", members: new Map() };
+  check("outputBaseDir treats an empty explicit source as inheriting, not as the workspace root",
+        viewPage.outputBaseDir(ctxForOutput, "", "Frankfurt_1864") !== "/ws",
+        viewPage.outputBaseDir(ctxForOutput, "", "Frankfurt_1864"));
+  check("outputBaseDir still targets the workspace root for a genuine plain task",
+        viewPage.outputBaseDir(ctxForOutput, undefined, undefined) === "/ws");
+}
+
+// --- /select-source's member precedence (the SHIPPED helper) ----------------
+// This previously lived inline in the pi entrypoint's command closure, so the
+// canary re-typed the expression and asserted about its own copy — it stayed
+// green when the real fix was reverted. pickMemberByRequest is now exported and
+// the command calls it, so these exercise production code.
+{
+  const { pickMemberByRequest } = await import("../dist/tools/collection-context.js");
+  const members = [
+    { ref: "a/X", path: "/ws/sources/a/X", dataDir: "/ws/data/a--X" },
+    { ref: "X", path: "/ws/sources/X", dataDir: "/ws/data/X" },
+  ].sort((m, n) => m.ref.localeCompare(n.ref)); // the command sorts by ref; "a/X" sorts first
+
+  check("an EXACT ref wins over an earlier-sorting member whose basename also matches",
+        pickMemberByRequest(members, "X")?.ref === "X", pickMemberByRequest(members, "X")?.ref);
+  check("an exact nested ref still resolves to itself",
+        pickMemberByRequest(members, "a/X")?.ref === "a/X", pickMemberByRequest(members, "a/X")?.ref);
+  check("a basename with no exact-ref rival still resolves via basename",
+        pickMemberByRequest([members.find((m) => m.ref === "a/X")], "X")?.ref === "a/X");
+  check("an unknown request resolves to nothing",
+        pickMemberByRequest(members, "nope") === undefined);
+}
+
+// --- fork carry-forward: the GUARD, not just the primitive ------------------
+// Neutering the hook's `reason === "fork" && previousSessionFile` test used to
+// leave every canary green. The guard is now a pure exported function.
+{
+  const { forkedPreviousSessionFile, sessionIdFromFile } = await import("../dist/utils/session-file-id.js");
+
+  check("a fork with a previous file is carried",
+        forkedPreviousSessionFile({ reason: "fork", previousSessionFile: "/s/old.jsonl" }) === "/s/old.jsonl");
+  check("a fork with NO previous file is not carried",
+        forkedPreviousSessionFile({ reason: "fork" }) === undefined);
+  for (const reason of ["startup", "resume", "switch", undefined]) {
+    check(`reason "${reason}" is not treated as a fork`,
+          forkedPreviousSessionFile({ reason, previousSessionFile: "/s/old.jsonl" }) === undefined);
+  }
+
+  // The bounded header read: correct id, and no silent failure on a large file.
+  const ws = workspace();
+  const good = join(ws, "good.jsonl");
+  writeFileSync(good, JSON.stringify({ type: "session", version: 1, id: "SESSION-ID-1" }) + "\n" + "x".repeat(5000) + "\n");
+  check("sessionIdFromFile reads the id from the header line",
+        sessionIdFromFile(good) === "SESSION-ID-1", String(sessionIdFromFile(good)));
+
+  // A header line longer than the bounded read must fail closed, not hang or
+  // return a truncated id.
+  const huge = join(ws, "huge.jsonl");
+  writeFileSync(huge, JSON.stringify({ type: "session", id: "X", pad: "y".repeat(100 * 1024) }) + "\n");
+  check("a header exceeding the read limit fails closed (undefined, no throw)",
+        sessionIdFromFile(huge) === undefined, String(sessionIdFromFile(huge)));
+
+  // A trailing-newline-free single-line file is still valid.
+  const noNewline = join(ws, "nonl.jsonl");
+  writeFileSync(noNewline, JSON.stringify({ type: "session", id: "SESSION-ID-2" }));
+  check("a header with no trailing newline still parses",
+        sessionIdFromFile(noNewline) === "SESSION-ID-2", String(sessionIdFromFile(noNewline)));
+
+  check("a missing file yields undefined",
+        sessionIdFromFile(good.replace("good", "missing")) === undefined);
+
+  // Genuinely a non-session first line (the check above only covered a MISSING file).
+  const notSession = join(ws, "notsession.jsonl");
+  writeFileSync(notSession, JSON.stringify({ type: "message", id: "not-a-session" }) + "\n");
+  check("a first line that is not a session header yields undefined",
+        sessionIdFromFile(notSession) === undefined, String(sessionIdFromFile(notSession)));
+
+  const nonStringId = join(ws, "numericid.jsonl");
+  writeFileSync(nonStringId, JSON.stringify({ type: "session", id: 12345 }) + "\n");
+  check("a non-string id yields undefined",
+        sessionIdFromFile(nonStringId) === undefined, String(sessionIdFromFile(nonStringId)));
+
+  const empty = join(ws, "empty.jsonl");
+  writeFileSync(empty, "");
+  check("an empty file yields undefined (bounded read over an uninitialized buffer)",
+        sessionIdFromFile(empty) === undefined, String(sessionIdFromFile(empty)));
+
+  // A multi-byte header must survive slicing at the first newline BYTE.
+  const utf8 = join(ws, "utf8.jsonl");
+  writeFileSync(utf8, JSON.stringify({ type: "session", id: "ID-Ü", cwd: "/würzburg/städte/東京" }) + "\n");
+  check("a multi-byte UTF-8 header parses (0x0A cannot occur inside a multi-byte sequence)",
+        sessionIdFromFile(utf8) === "ID-Ü", String(sessionIdFromFile(utf8)));
+}
+
+// --- change_source must REFUSE a ref collision, not silently bind elsewhere --
+// An out-of-tree archive derives its ref from the BASENAME, so /mnt/archive/F_1864
+// collides with an in-tree sources/F_1864. The add was a no-op while the tool
+// reported success WITH THE ARCHIVE'S page count and path — after which every
+// page tool silently read the other document.
+{
+  const { deriveRef, dataKeyForRef } = await import("../dist/tools/collection-context.js");
+  const ws = workspace();
+  const inTree = makeSource(ws, "Frankfurt_1864");
+  const outOfTree = join(mkdtempSync(join(tmpdir(), "ch-archive-")), "Frankfurt_1864");
+  mkdirSync(join(outOfTree, "png"), { recursive: true });
+  writeFileSync(join(outOfTree, "png", "page_0001.png"), Buffer.alloc(8));
+
+  // The collision this guards against is real, not hypothetical:
+  check("an out-of-tree source SHARES the in-tree source's ref when basenames match",
+        deriveRef(ws, outOfTree) === deriveRef(ws, inTree),
+        `${deriveRef(ws, outOfTree)} vs ${deriveRef(ws, inTree)}`);
+  check("...and therefore the same data key, so both would write to one dir",
+        dataKeyForRef(deriveRef(ws, outOfTree), outOfTree) === dataKeyForRef(deriveRef(ws, inTree), inTree));
+
+  // Drive the real compiled tool.
+  const { createChangeSourceTool } = await import("../dist/tools/change-source.js");
+  const { createCollectionContext: makeCtx2, buildCollectionFromDiscovery: build2 } =
+    await import("../dist/tools/collection-context.js");
+  const ctx = makeCtx2();
+  build2(ctx, ws);
+  const tool = createChangeSourceTool(ctx, "desc");
+  const extCtx = { cwd: ws, sessionManager: { getSessionId: () => "sess-collide" } };
+  const res = await tool.execute("call-1", { source_path: outOfTree }, undefined, undefined, extCtx);
+  const text = res.content.map((c) => c.text).join("\n");
+
+  check("change_source REFUSES the colliding add instead of reporting success",
+        /cannot add/i.test(text), text.slice(0, 160));
+  check("the refusal names the directory already holding that ref",
+        text.includes(inTree), text.slice(0, 200));
+  check("the in-tree member is left pointing at the in-tree directory",
+        ctx.members.get("Frankfurt_1864")?.path === inTree, ctx.members.get("Frankfurt_1864")?.path);
+  check("the colliding source was NOT silently added",
+        ctx.members.size === 1, JSON.stringify([...ctx.members.keys()]));
+
+  // The non-colliding case must still work.
+  const distinct = join(mkdtempSync(join(tmpdir(), "ch-archive2-")), "Koeln_1871");
+  mkdirSync(join(distinct, "png"), { recursive: true });
+  writeFileSync(join(distinct, "png", "page_0001.png"), Buffer.alloc(8));
+  const ok = await tool.execute("call-2", { source_path: distinct }, undefined, undefined, extCtx);
+  check("a non-colliding out-of-tree source is still added",
+        ctx.members.get("Koeln_1871")?.path === distinct,
+        ok.content.map((c) => c.text).join("").slice(0, 160));
+  // Re-adding the SAME path is idempotent, not a collision.
+  const again = await tool.execute("call-3", { source_path: distinct }, undefined, undefined, extCtx);
+  check("re-adding the identical path is idempotent, not refused",
+        !/cannot add/i.test(again.content.map((c) => c.text).join("")),
+        again.content.map((c) => c.text).join("").slice(0, 160));
+
+  // ONE directory, several spellings. The collision check is a STRING compare
+  // against the stored member path, so without normalizing the input first, a
+  // trailing slash refused an add whose "owner" was that very directory — and the
+  // refusal text named the same path twice, sending the agent off to rename it.
+  const trailing = await tool.execute("call-4", { source_path: distinct + "/" }, undefined, undefined, extCtx);
+  const trailingText = trailing.content.map((c) => c.text).join("");
+  check("a trailing slash on an already-added path is NOT refused (same directory)",
+        !/cannot add/i.test(trailingText), trailingText.slice(0, 200));
+  check("...and it did not create a second member",
+        [...ctx.members.values()].filter((m) => m.path === distinct).length === 1,
+        JSON.stringify([...ctx.members.keys()]));
+
+  // basename("/a/S/.") is ".", which made ref "." and pointed the source's data dir
+  // at the workspace data/ ROOT — reported as success.
+  const dotted = await tool.execute("call-5", { source_path: distinct + "/." }, undefined, undefined, extCtx);
+  const dottedText = dotted.content.map((c) => c.text).join("");
+  check('a "/." suffix does not produce ref "." pointing at the data/ root',
+        !ctx.members.has("."), JSON.stringify([...ctx.members.keys()]));
+  check('...and resolves to the real ref instead',
+        /Koeln_1871/.test(dottedText) && !/Cannot add/i.test(dottedText), dottedText.slice(0, 200));
+}
+
+// --- resolveByAlias must not fold a POSIX backslash either -------------------
+// Same bug class as the deriveRef regression, on the LENIENT path: the fallback
+// invites a `sources/` prefix, and folding `\` made `sources/weird\Name_1900` (a
+// real one-component dir) resolve to a genuinely nested `weird/Name_1900`.
+{
+  const { createCollectionContext: mk, buildCollectionFromDiscovery: build, resolveSource } =
+    await import("../dist/tools/collection-context.js");
+  const ws = workspace();
+  const literal = makeSource(ws, "weird\\Name_1900");
+  const nested = makeSource(ws, "weird/Name_1900");
+  const ctx = mk();
+  build(ctx, ws);
+
+  check("the sources/-prefixed literal-backslash spelling resolves to THAT directory",
+        resolveSource(ctx, "sources/weird\\Name_1900").path === literal,
+        resolveSource(ctx, "sources/weird\\Name_1900").path);
+  check("the sources/-prefixed nested spelling still resolves to the nested directory",
+        resolveSource(ctx, "sources/weird/Name_1900").path === nested,
+        resolveSource(ctx, "sources/weird/Name_1900").path);
+  check("an exact ref still wins regardless",
+        resolveSource(ctx, "weird/Name_1900").path === nested);
 }
 
 console.log(failures === 0 ? "\ncollection canary OK" : `\n${failures} FAILURE(S)`);

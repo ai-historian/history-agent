@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync } from "node:fs";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { listPageIds } from "../utils/page-files.js";
@@ -25,9 +25,13 @@ export function createChangeSourceTool(ctx: CollectionContext, description: stri
     parameters: changeSourceParams,
     async execute(_toolCallId, params, _signal, _onUpdate, extCtx: ExtensionContext) {
       const workspaceDir = extCtx.cwd;
-      const sourcePath = isAbsolute(params.source_path)
-        ? params.source_path
-        : join(workspaceDir, params.source_path);
+      // resolve() so ONE directory has ONE spelling. Two consequences, both real:
+      // the collision check below compares this against a stored member path, and a
+      // trailing slash would make "/a/S/" look like a different directory from
+      // "/a/S" — refusing an add whose "owner" is that very directory. And
+      // deriveRef's basename of "/a/S/." is ".", which made ref "." and pointed the
+      // source's data dir at the workspace data/ ROOT while reporting success.
+      const sourcePath = resolve(isAbsolute(params.source_path) ? params.source_path : join(workspaceDir, params.source_path));
 
       if (!existsSync(sourcePath)) {
         return {
@@ -47,11 +51,38 @@ export function createChangeSourceTool(ctx: CollectionContext, description: stri
       // Ref + data dir via the shared helpers so this agrees with discovery and
       // manifest loading (flat sources → data/<basename>, nested → data/<slug>).
       const ref = deriveRef(workspaceDir, sourcePath);
+
+      // An out-of-tree source derives its ref from the BASENAME, so an archive at
+      // /mnt/archive/Frankfurt_1864 collides with an in-tree sources/Frankfurt_1864.
+      // Adding it was a no-op while this tool still reported success with the
+      // ARCHIVE's page count and path — after which every list_pages/task silently
+      // read the other document and both wrote into one data/ dir. Refuse instead:
+      // a wrong source that looks right is the worst outcome here, and resolveByAlias
+      // (which throws on an ambiguous basename) is never reached, because this
+      // collision happens before any lookup.
+      const existing = ctx.members.get(ref);
+      if (existing && existing.path !== sourcePath) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Cannot add ${sourcePath}: its ref "${ref}" is already taken by ${existing.path}.\n` +
+                `Two different directories cannot share one ref — the pages and the extracted data ` +
+                `would be attributed to the wrong source. Rename the directory you are adding (its ` +
+                `basename is what makes the ref), or move it under the workspace's sources/ tree, ` +
+                `where a nested path keeps it distinct.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
       const dataDir = join(workspaceDir, "data", dataKeyForRef(ref, sourcePath));
       mkdirSync(dataDir, { recursive: true });
 
       // Idempotent add — the auto-collection already holds every source under sources/.
-      if (!ctx.members.has(ref)) {
+      if (!existing) {
         ctx.members.set(ref, { ref, path: sourcePath, dataDir });
       }
 
