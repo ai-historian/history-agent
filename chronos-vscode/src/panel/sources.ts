@@ -1,9 +1,47 @@
-import { readdirSync, statSync, existsSync } from "node:fs";
+import { readdirSync, statSync, existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { refFromRelative } from "./data-key.js";
 
 export interface SourceInfo {
   name: string;
   path: string;
+}
+
+export interface CollectionInfo {
+  /** The filename stem — the collection's stable identity; `name` is display-only. */
+  id: string;
+  name: string;
+  description?: string;
+  memberCount: number;
+}
+
+/** Named collections declared in collections/<name>.json (mirrors the agent's
+ *  listCollections). The picker lists these plus a synthetic "all sources". */
+export function discoverCollections(workspaceDir: string): CollectionInfo[] {
+  const dir = join(workspaceDir, "collections");
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: CollectionInfo[] = [];
+  for (const f of entries) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const m = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+      const id = f.replace(/\.json$/, "");
+      out.push({
+        id,
+        name: typeof m.name === "string" ? m.name : id,
+        description: typeof m.description === "string" ? m.description : undefined,
+        memberCount: Array.isArray(m.members) ? m.members.length : 0,
+      });
+    } catch {
+      // skip unparseable manifest
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function countPages(sourceDir: string): number {
@@ -29,7 +67,16 @@ export function discoverSources(rootDir: string): SourceInfo[] {
     }
 
     if (existsSync(join(dir, "png")) && statSync(join(dir, "png")).isDirectory()) {
-      sources.push({ name: relative(rootDir, dir), path: dir });
+      // Normalize to forward slashes so this matches the agent's ref exactly.
+      // relative() is platform-native (backslash-joined on win32); the agent's
+      // collectionCtx member ref is always normalized (see collection-context.ts's
+      // deriveRef), and /select-source compares `name` against that ref verbatim
+      // (chronos-panel.ts sends `msg.name` straight through as the ref argument).
+      // Without this, a nested source's name would never match its ref on win32.
+      // Uses the shared helper rather than a third copy of the transform, and
+      // translates only the platform separator — a POSIX dir named `city\Nested`
+      // is ONE component and must keep its backslash.
+      sources.push({ name: refFromRelative(relative(rootDir, dir)), path: dir });
       return;
     }
 

@@ -1,11 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, basename, dirname } from "node:path";
+import { join, basename, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as dotenvConfig } from "dotenv";
 
-import { createSourceContext, type SourceContext } from "../tools/source-context.js";
+import {
+  createCollectionContext,
+  buildCollectionFromDiscovery,
+  collectionDataDir,
+  collectionMemoryPath,
+  replayExtraMembers,
+  pickMemberByRequest,
+  type CollectionContext,
+} from "../tools/collection-context.js";
 import { createListPagesTool } from "../tools/list-pages.js";
 import { createTaskTool } from "../tools/view-page.js";
 import { createShowPageTool } from "../tools/show-page.js";
@@ -17,9 +25,10 @@ import { restoreExpertSessions } from "../tools/expert-turn.js";
 import { loadExpertTasks } from "../utils/expert-store.js";
 import { loadToolText, loadPromptFile } from "../utils/tool-loader.js";
 import { listPageIds } from "../utils/page-files.js";
-import { discoverSources } from "../utils/source-discovery.js";
 import { ensureWorkspace } from "../utils/workspace.js";
-import { saveSessionSource, loadSessionSource } from "../utils/session-source-store.js";
+import { listCollections, loadCollectionInto, resolveSessionCollectionSelection } from "../utils/collection-manifest.js";
+import { saveSessionCollection, loadSessionCollection, carryForkedSessionState } from "../utils/session-collection-store.js";
+import { sessionIdFromFile, forkedPreviousSessionFile } from "../utils/session-file-id.js";
 import { getNamedPromptCount, saveSessionName } from "../utils/session-name-store.js";
 import { generateSessionTitle } from "../utils/session-namer.js";
 import { connectHttp, sendToExtension, disconnectHttp } from "../http/http-client.js";
@@ -47,31 +56,31 @@ function writeWorkspaceSettings(cwd: string, settings: Record<string, unknown>) 
 }
 
 export default function (pi: ExtensionAPI) {
-  // Shared mutable source context — updated by /select-source and change_source tool
-  const sourceCtx: SourceContext = createSourceContext(null, null, null);
+  // Shared mutable collection context — the active unit of work. Rebuilt from
+  // discovery on every session start; tools resolve their required `source` ref
+  // against it. "Everything is a collection; a single doc is a collection of one."
+  const collectionCtx: CollectionContext = createCollectionContext();
 
   // ── Register all custom tools ──────────────────────────────────────────
 
   const expertRegistry = createExpertRegistry();
   const pageExpertPrompt = loadPromptFile("page-expert-prompt.md");
 
-  pi.registerTool(createListPagesTool(sourceCtx, loadToolText("list-pages.md").description));
-  pi.registerTool(createTaskTool(sourceCtx, expertRegistry, loadToolText("task.md").description, pageExpertPrompt));
-  pi.registerTool(createShowPageTool(sourceCtx, loadToolText("show-page.md").description));
-  pi.registerTool(createShowTextTool(sourceCtx, loadToolText("show-text.md").description));
-  pi.registerTool(createTaskBatchTool(sourceCtx, expertRegistry, loadToolText("task-batch.md"), pageExpertPrompt));
-  pi.registerTool(createChangeSourceTool(sourceCtx, loadToolText("change-source.md").description));
+  pi.registerTool(createListPagesTool(collectionCtx, loadToolText("list-pages.md").description));
+  pi.registerTool(createTaskTool(collectionCtx, expertRegistry, loadToolText("task.md").description, pageExpertPrompt));
+  pi.registerTool(createShowPageTool(collectionCtx, loadToolText("show-page.md").description));
+  pi.registerTool(createShowTextTool(collectionCtx, loadToolText("show-text.md").description));
+  pi.registerTool(createTaskBatchTool(collectionCtx, expertRegistry, loadToolText("task-batch.md"), pageExpertPrompt));
+  pi.registerTool(createChangeSourceTool(collectionCtx, loadToolText("change-source.md").description));
 
   // ── /select-source command ─────────────────────────────────────────────
 
   pi.registerCommand("select-source", {
-    description: "Browse the workspace sources/ tree and select a source to work with",
+    description: "Preview a source from the active collection in the page viewer",
     handler: async (args, ctx) => {
-      const workspaceDir = ctx.cwd;
-      const sourcesDir = join(workspaceDir, "sources");
-      const sources = discoverSources(sourcesDir);
+      const members = [...collectionCtx.members.values()].sort((a, b) => a.ref.localeCompare(b.ref));
 
-      if (sources.length === 0) {
+      if (members.length === 0) {
         ctx.ui.notify(
           "No sources found. Add a directory with a png/ subfolder under sources/.",
           "warning",
@@ -79,54 +88,123 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Non-interactive: `/select-source <name>` — the entire args string is
-      // the source name (names are relative paths and may contain spaces).
-      let source: (typeof sources)[number] | undefined;
-      const requestedName = (args ?? "").trim();
-      if (requestedName) {
-        source = sources.find((s) => s.name === requestedName || basename(s.path) === requestedName);
-        if (!source) {
-          ctx.ui.notify(`Source "${requestedName}" not found.`, "warning");
+      // Non-interactive: `/select-source <ref>` — the entire args string is the
+      // member ref (refs are workspace-relative paths and may contain spaces).
+      let member: (typeof members)[number] | undefined;
+      const requested = (args ?? "").trim();
+      if (requested) {
+        // Exact ref beats basename — see pickMemberByRequest, which owns this
+        // precedence so the canary can exercise the shipped code rather than a
+        // retyped copy of it.
+        member = pickMemberByRequest(members, requested);
+        if (!member) {
+          ctx.ui.notify(`Source "${requested}" not found.`, "warning");
           return;
         }
       } else {
-        const items = sources.map((s) => `${s.name}  (${listPageIds(s.path).length} pages)`);
-        const selected = await ctx.ui.select("Select a source", items);
+        const items = members.map((m) => `${m.ref}  (${listPageIds(m.path).length} pages)`);
+        const selected = await ctx.ui.select("Preview a source", items);
         if (!selected) return;
-        source = sources[items.indexOf(selected)];
+        member = members[items.indexOf(selected)];
       }
 
-      const sourceName = basename(source.path);
-      const sourceDataDir = join(workspaceDir, "data", sourceName);
-      mkdirSync(sourceDataDir, { recursive: true });
-
-      // Update shared context — all tools pick this up on their next call
-      sourceCtx.sourceDir = source.path;
-      sourceCtx.sourceName = sourceName;
-      sourceCtx.sourceDataDir = sourceDataDir;
-
-      // Remember the choice for this session so resuming restores it (sidecar
-      // only — nothing is written to the conversation history).
-      saveSessionSource(workspaceDir, ctx.sessionManager.getSessionId(), source.path);
-
-      // Show the first page in the VS Code viewer if IPC is active
+      // Preview the first page in the viewer. There is no single "current source"
+      // anymore — page tools take an explicit `source` ref — so this only previews.
       sendToExtension({
         type: "show_page",
         pageId: 1,
-        totalPages: listPageIds(source.path).length,
-        sourceDir: source.path,
-        sourceName,
+        totalPages: listPageIds(member.path).length,
+        sourceDir: member.path,
+        sourceName: basename(member.dataDir),
         bbox: null,
       });
 
-      // Inform the model so it acknowledges the new source
+      // Nudge the model toward the ref to pass as `source`. Keep the "Source
+      // selected:" prefix — the session auto-namer filters it out.
       pi.sendUserMessage(
-        `Source selected: "${sourceName}" at ${source.path}. ` +
-          `Please acknowledge and confirm you are ready to work with this source.`,
+        `Source selected: "${member.ref}" (previewing in the viewer). ` +
+          `Pass source: "${member.ref}" when calling page tools (list_pages, show_page, task, …).`,
         { deliverAs: "followUp" },
       );
 
-      ctx.ui.notify(`Source: ${sourceName}`, "info");
+      ctx.ui.notify(`Source: ${member.ref}`, "info");
+    },
+  });
+
+  // ── /select-collection command ─────────────────────────────────────────
+
+  const ALL_SOURCES = "(all sources)";
+
+  pi.registerCommand("select-collection", {
+    description: "Select a named collection to work over (or all sources)",
+    handler: async (args, ctx) => {
+      const collections = listCollections(ctx.cwd);
+
+      // Resolve the choice: null = the auto "all sources" collection.
+      let chosen: string | null | undefined;
+      const requested = (args ?? "").trim();
+      if (requested) {
+        if (requested === ALL_SOURCES || requested.toLowerCase() === "all") {
+          chosen = null;
+        } else {
+          // Match on id only — id is the stable identity. A display-name
+          // fallback here would be actively dangerous: a requested value that
+          // happens to equal a DIFFERENT collection's display name would
+          // silently resolve to the wrong collection (see Item B).
+          const found = collections.find((c) => c.id === requested);
+          if (!found) {
+            ctx.ui.notify(`Collection "${requested}" not found.`, "warning");
+            return;
+          }
+          chosen = found.id;
+        }
+      } else {
+        const items = [
+          ALL_SOURCES,
+          ...collections.map(
+            (c) => `${c.name}  (${c.memberCount} sources)${c.description ? ` — ${c.description}` : ""}`,
+          ),
+        ];
+        const selected = await ctx.ui.select("Select a collection", items);
+        if (selected === undefined) return;
+        const idx = items.indexOf(selected);
+        chosen = idx <= 0 ? null : collections[idx - 1].id;
+      }
+
+      // Apply to the shared context (mutated in place so tools see it).
+      if (chosen === null) {
+        buildCollectionFromDiscovery(collectionCtx, ctx.cwd);
+      } else if (!loadCollectionInto(collectionCtx, ctx.cwd, chosen)) {
+        ctx.ui.notify(`Collection "${chosen}" could not be loaded (missing or empty manifest).`, "warning");
+        return;
+      }
+      // Both branches above rebuild/clear the catalog from scratch, which would
+      // otherwise silently drop out-of-tree sources added via change_source this
+      // session — re-add them before persisting the new selection.
+      replayExtraMembers(collectionCtx, ctx.cwd, ctx.sessionManager.getSessionId());
+      saveSessionCollection(ctx.cwd, ctx.sessionManager.getSessionId(), chosen);
+
+      // Tell the viewer the active collection (picker state) and preview the first member.
+      emitActiveCollection(collectionCtx);
+      const first = collectionCtx.members.values().next().value;
+      if (first) {
+        sendToExtension({
+          type: "show_page",
+          pageId: 1,
+          totalPages: listPageIds(first.path).length,
+          sourceDir: first.path,
+          sourceName: basename(first.dataDir),
+          bbox: null,
+        });
+      }
+
+      const label = collectionCtx.name ?? ALL_SOURCES;
+      pi.sendUserMessage(
+        `Collection selected: "${label}" — ${collectionCtx.members.size} source(s). ` +
+          `Pass a source ref (see the catalog) to page tools.`,
+        { deliverAs: "followUp" },
+      );
+      ctx.ui.notify(`Collection: ${label} (${collectionCtx.members.size})`, "info");
     },
   });
 
@@ -144,23 +222,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Lifecycle events ───────────────────────────────────────────────────
-
-  // Re-establish the source this session last worked on. Restoring only sets
-  // the in-memory context (and syncs the viewer over HTTP) — it adds no message
-  // to the history, so the model API request is unchanged. The system prompt,
-  // rebuilt every turn, then reflects the source on its own.
-  const restoreSource = (ctx: ExtensionContext) => {
-    const saved = loadSessionSource(ctx.cwd, ctx.sessionManager.getSessionId());
-    if (!saved || !applySource(sourceCtx, ctx.cwd, saved)) return;
-    sendToExtension({
-      type: "show_page",
-      pageId: 1,
-      totalPages: listPageIds(saved).length,
-      sourceDir: saved,
-      sourceName: sourceCtx.sourceName!,
-      bbox: null,
-    });
-  };
 
   // Rebuild this session's persisted expert (task/task_batch) conversations so
   // task_id follow-ups keep working across agent restarts and session resumes.
@@ -181,19 +242,55 @@ export default function (pi: ExtensionAPI) {
     dotenvConfig({ path: join(ctx.cwd, ".chronos", ".env") });
     // session_start fires for the initial startup AND every switch/resume/fork
     // (0.79 folded the former session_switch event into this, distinguished by
-    // event.reason). On a switch the in-memory source + experts belong to the
-    // previous session — clear them before restoring the target session's state.
+    // event.reason). On a switch the in-memory experts belong to the previous
+    // session — clear them before restoring the target session's state.
     if (event.reason !== "startup") {
-      sourceCtx.sourceDir = null;
-      sourceCtx.sourceName = null;
-      sourceCtx.sourceDataDir = null;
       expertRegistry.sessions.clear();
       expertRegistry.nextId = 1;
     }
     // session_shutdown clears the viewer HTTP flag before each switch, so
     // (re)connect on every start. connectHttp is idempotent.
     connectHttp();
-    restoreSource(ctx);
+    // The collection auto-forms from the sources/ tree — cheap FS walk, rebuilt
+    // fresh every start so switches/resumes never carry a stale catalog. If this
+    // session had narrowed to a named collection, re-narrow to it (falling back
+    // to all sources if that manifest is gone).
+    buildCollectionFromDiscovery(collectionCtx, ctx.cwd);
+    const sessionId = ctx.sessionManager.getSessionId();
+    // A fork (VS Code's "edit a past message") mints a brand-new session id —
+    // this session's sidecars (collection selection, change_source
+    // extraMembers) are empty until we copy them over from the session it
+    // forked from. previousSessionFile is a FILE PATH, not an id, so read the
+    // old session's id out of its own header first.
+    const forkedFrom = forkedPreviousSessionFile(event);
+    if (forkedFrom) {
+      const previousSessionId = sessionIdFromFile(forkedFrom);
+      if (previousSessionId) carryForkedSessionState(ctx.cwd, previousSessionId, sessionId);
+      // pi defers creating a session file until the first assistant response, so a
+      // fork taken before one lands has nothing to read. Never silent — this is the
+      // one shape where the carry no-ops and the user just sees their added sources
+      // gone.
+      else console.warn(`[chronos] fork: could not read a session id from ${forkedFrom} — not carrying state forward.`);
+    }
+    const savedCollection = loadSessionCollection(ctx.cwd, sessionId);
+    // Pure decision (testable without I/O) on which id to attempt, matched by
+    // id only — see resolveSessionCollectionSelection's docblock for why a
+    // display-name fallback/migration is deliberately absent. The actual load
+    // is still imperative — it touches disk and mutates collectionCtx.
+    const decision = resolveSessionCollectionSelection(savedCollection, listCollections(ctx.cwd));
+    if (decision.idToLoad) {
+      if (!loadCollectionInto(collectionCtx, ctx.cwd, decision.idToLoad)) {
+        console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
+      }
+    } else if (savedCollection) {
+      console.warn(`[chronos] saved collection "${savedCollection}" not found; using all sources`);
+    }
+    // Re-add out-of-tree sources added via change_source this session.
+    // buildCollectionFromDiscovery above wiped them, and a named-collection
+    // restore does not know about them either.
+    replayExtraMembers(collectionCtx, ctx.cwd, sessionId);
+    // Tell the viewer which collection is active so the picker reflects it.
+    emitActiveCollection(collectionCtx);
     await restoreExperts(ctx);
   });
 
@@ -216,7 +313,7 @@ export default function (pi: ExtensionAPI) {
   // ── System prompt injection (every turn) ───────────────────────────────
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    return { systemPrompt: buildChronosSystemPrompt(sourceCtx, ctx.cwd) };
+    return { systemPrompt: buildChronosSystemPrompt(collectionCtx, ctx.cwd) };
   });
 
   // Note: chat/tool streaming (text deltas, tool start/end, turn end) reaches
@@ -240,18 +337,15 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
-// Point the shared context at a source directory without touching the model
-// conversation. Returns false if the path is no longer a valid source (e.g.
-// deleted since it was saved), leaving the context unchanged.
-function applySource(sourceCtx: SourceContext, workspaceDir: string, sourcePath: string): boolean {
-  if (!existsSync(sourcePath) || !existsSync(join(sourcePath, "png"))) return false;
-  const sourceName = basename(sourcePath);
-  const sourceDataDir = join(workspaceDir, "data", sourceName);
-  mkdirSync(sourceDataDir, { recursive: true });
-  sourceCtx.sourceDir = sourcePath;
-  sourceCtx.sourceName = sourceName;
-  sourceCtx.sourceDataDir = sourceDataDir;
-  return true;
+// Tell the VS Code viewer which collection is active (picker state) and where its
+// collection-level outputs (entity index) live, so the Data tab can surface them.
+function emitActiveCollection(collectionCtx: CollectionContext): void {
+  sendToExtension({
+    type: "collection",
+    id: collectionCtx.id,
+    name: collectionCtx.name,
+    dataDir: collectionDataDir(collectionCtx),
+  });
 }
 
 // ── Session auto-naming ─────────────────────────────────────────────────────
@@ -276,7 +370,7 @@ function userPromptsFromSession(entries: { type: string; [k: string]: any }[]): 
     const message = entry.message;
     if (!message || message.role !== "user") continue;
     const text = textOfMessageContent(message.content)?.trim();
-    if (!text || text.startsWith("Source selected:")) continue;
+    if (!text || text.startsWith("Source selected:") || text.startsWith("Collection selected:")) continue;
     prompts.push(text);
   }
   return prompts;
@@ -317,38 +411,67 @@ async function maybeNameSession(ctx: ExtensionContext): Promise<void> {
 
 // ── System prompt builder ──────────────────────────────────────────────
 
-function buildChronosSystemPrompt(sourceCtx: SourceContext, cwd: string): string {
+// Cap the rendered catalog so a large archive doesn't blow the system prompt.
+// The full set stays resolvable via `resolveSource`; the table is a summary.
+const ROSTER_ROW_CAP = 60;
+
+// Render the active collection's catalog as a markdown table the agent can read
+// to pick a `source` ref without a tool call.
+function renderRoster(collectionCtx: CollectionContext): string {
+  const members = [...collectionCtx.members.values()].sort((a, b) => a.ref.localeCompare(b.ref));
+  if (members.length === 0) {
+    return "_No sources found. Add a directory containing a `png/` subfolder under `sources/`._";
+  }
+  const memoryDir = join(collectionCtx.workspaceDir, "memory");
+  const shown = members.slice(0, ROSTER_ROW_CAP);
+  const rows = shown.map((m) => {
+    const pages = listPageIds(m.path).length;
+    const meta =
+      m.meta && Object.keys(m.meta).length > 0
+        ? Object.entries(m.meta)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(" ")
+        : "";
+    // ✓ when memory/<ref>.md exists, so the agent knows to read it before working the source.
+    const mem = existsSync(join(memoryDir, `${m.ref}.md`)) ? "✓" : "";
+    return `| \`${m.ref}\` | ${pages} | ${meta} | ${relative(collectionCtx.workspaceDir, m.dataDir)}/ | ${mem} |`;
+  });
+  const table = ["| source (ref) | pages | meta | data dir | mem |", "|---|---|---|---|---|", ...rows].join("\n");
+  if (members.length > ROSTER_ROW_CAP) {
+    return (
+      table +
+      `\n\n_…and ${members.length - ROSTER_ROW_CAP} more. Use \`list_pages(source)\` to inspect any source not listed._`
+    );
+  }
+  return table;
+}
+
+function buildChronosSystemPrompt(collectionCtx: CollectionContext, cwd: string): string {
   const memoryDir = join(cwd, "memory");
   const skillsDir = join(cwd, "skills");
   const dataDir = join(cwd, "data");
   const template = readFileSync(join(PROMPTS_DIR, "system-prompt.md"), "utf-8");
 
-  const resolvedSourceDir = sourceCtx.sourceDir ?? "(no source selected — use /select-source)";
-  const resolvedSourceName = sourceCtx.sourceName ?? "(no source selected)";
-  const sourceDataDir = sourceCtx.sourceDataDir ?? "(no source selected)";
-  const sourceMemoryPath = sourceCtx.sourceName
-    ? join(memoryDir, `${sourceCtx.sourceName}.md`)
-    : "(no source selected)";
-
-  let documentMemory = "";
-  if (sourceCtx.sourceName) {
-    const mp = join(memoryDir, `${sourceCtx.sourceName}.md`);
-    if (existsSync(mp)) documentMemory = readFileSync(mp, "utf-8").trim();
-  }
-
   let globalMemory = "";
   const gmp = join(memoryDir, "MEMORY.MD");
   if (existsSync(gmp)) globalMemory = readFileSync(gmp, "utf-8").trim();
 
+  // Collection memory: always-on tier for cross-source, long-horizon findings.
+  const cmp = collectionMemoryPath(collectionCtx);
+  let collectionMemory = "";
+  if (existsSync(cmp)) collectionMemory = readFileSync(cmp, "utf-8").trim();
+
   return template
     .replaceAll("{{workspaceDir}}", cwd)
-    .replaceAll("{{sourceDir}}", resolvedSourceDir)
-    .replaceAll("{{sourceName}}", resolvedSourceName)
+    .replaceAll("{{collectionName}}", collectionCtx.name ?? "(all sources)")
+    .replaceAll("{{collectionDescription}}", collectionCtx.description ?? "")
+    .replaceAll("{{sourceCount}}", String(collectionCtx.members.size))
+    .replaceAll("{{collectionRoster}}", renderRoster(collectionCtx))
+    .replaceAll("{{collectionDataDir}}", relative(cwd, collectionDataDir(collectionCtx)))
+    .replaceAll("{{collectionMemoryPath}}", relative(cwd, cmp))
+    .replaceAll("{{collectionMemory}}", collectionMemory || "_(empty — write cross-source findings here)_")
     .replaceAll("{{memoryDir}}", memoryDir)
-    .replaceAll("{{sourceMemoryPath}}", sourceMemoryPath)
-    .replaceAll("{{sourceDataDir}}", sourceDataDir)
     .replaceAll("{{skillsDir}}", skillsDir)
     .replaceAll("{{dataDir}}", dataDir)
-    .replaceAll("{{documentMemory}}", documentMemory)
     .replaceAll("{{globalMemory}}", globalMemory);
 }

@@ -4,7 +4,8 @@ dist/
 *.js.map
 chronos-vscode/node_modules/
 chronos-vscode/out/
-chronos-vscode/.vscode-test/
+# VS Code test-electron download (appears wherever the UI test is run from)
+.vscode-test/
 *.tgz
 *.vsix
 *.html
@@ -12,3 +13,11 @@ paper.md
 win-vm.md
 soduco/
 assets/originals/
+# Workspace artifacts from dev-running the agent inside the repo
+/memory/
+/chronos-vscode/memory/
+# Implementation plans are working notes for a single change, not product docs —
+# they went stale the moment their branch landed and one of them was the largest
+# file in its own PR. Kept on disk, out of git. Specs (docs/superpowers/specs/)
+# stay tracked: they record WHY a design was chosen.
+docs/superpowers/plans/

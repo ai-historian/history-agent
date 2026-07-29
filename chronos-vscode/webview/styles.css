@@ -2310,6 +2310,27 @@ span.expert-tool.is-elevated {
   background: color-mix(in srgb, var(--ch-error) 14%, transparent);
 }
 
+/* live counts while the batch runs: in-flight and still-waiting experts */
+.expert-batch-running,
+.expert-batch-queued {
+  flex: 0 0 auto;
+  font-family: var(--ch-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 0 7px;
+  border-radius: 999px;
+}
+
+.expert-batch-running {
+  color: var(--ch-fg);
+  background: color-mix(in srgb, var(--ch-fg) 10%, transparent);
+}
+
+.expert-batch-queued {
+  color: var(--ch-muted);
+  background: color-mix(in srgb, var(--ch-muted) 12%, transparent);
+}
+
 .expert-batch-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
@@ -2347,6 +2368,18 @@ span.expert-tool.is-elevated {
   border-color: color-mix(in srgb, var(--ch-error) 35%, transparent);
 }
 
+/* queued: waiting for a worker slot — quiet and dimmed */
+.expert-chip.is-queued:disabled {
+  opacity: 0.45;
+}
+
+/* running: fully lit despite being non-clickable, with a brand edge */
+.expert-chip.is-running:disabled {
+  opacity: 1;
+  cursor: progress;
+  border-color: color-mix(in srgb, var(--ch-brand) 40%, transparent);
+}
+
 .expert-chip-page {
   font-weight: 650;
   font-size: 12px;
@@ -2365,6 +2398,9 @@ span.expert-tool.is-elevated {
   font-family: var(--ch-mono);
   font-size: 10px;
   color: var(--ch-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .expert-chip-dot {
@@ -2379,6 +2415,28 @@ span.expert-tool.is-elevated {
 .expert-chip-dot.is-error {
   background: var(--ch-error);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ch-error) 22%, transparent);
+}
+
+.expert-chip-dot.is-queued {
+  background: var(--ch-muted);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ch-muted) 16%, transparent);
+  opacity: 0.6;
+}
+
+.expert-chip-dot.is-running {
+  animation: chip-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes chip-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
 }
 
 /* ── viewer tabs (Page / Data) ───────────────────────────────────────────── */

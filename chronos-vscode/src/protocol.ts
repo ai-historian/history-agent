@@ -34,10 +34,22 @@ export interface ErrorMessage {
   message: string;
 }
 
+// The active collection: its id (the stable identity the picker matches
+// against; null = the auto "all sources" collection), its display name, and
+// its collection-level output dir so the Data tab can surface cross-source
+// files (e.g. the entity index) alongside the current source's.
+export interface CollectionMessage {
+  type: "collection";
+  id: string | null;
+  name: string | null;
+  dataDir: string;
+}
+
 export type AgentToExtensionMessage =
   | ShowPageMessage
   | PageListMessage
   | ShowTextMessage
+  | CollectionMessage
   | ErrorMessage;
 
 // Extension → Agent messages

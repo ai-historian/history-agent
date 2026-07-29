@@ -34,6 +34,8 @@ export class ChronosApp extends LitElement {
     toasts: { state: true },
     splitPct: { state: true },
     currentSource: { state: true },
+    collections: { state: true },
+    activeCollection: { state: true },
     yolo: { state: true },
     contextTokens: { state: true },
     sessionLoading: { state: true },
@@ -43,13 +45,16 @@ export class ChronosApp extends LitElement {
 
   declare state: RpcSessionState | null;
   declare models: ModelInfo[];
-  declare sources: { name: string; pageCount: number }[];
+  declare sources: { name: string; pageCount: number; dataKey: string }[];
   declare sessions: ChronosSessionInfo[];
   declare drawerOpen: boolean;
   declare uiRequest: RpcExtensionUIRequest | null;
   declare toasts: Toast[];
   declare splitPct: number;
   declare currentSource: string;
+  declare collections: { id: string; name: string; description?: string; memberCount: number }[];
+  /** The active collection's id (null = the auto "all sources" collection). */
+  declare activeCollection: string | null;
   declare yolo: boolean;
   declare contextTokens: number;
   declare sessionLoading: { title?: string; name: string; sizeBytes?: number } | null;
@@ -71,6 +76,8 @@ export class ChronosApp extends LitElement {
     this.toasts = [];
     this.splitPct = 52;
     this.currentSource = "";
+    this.collections = [];
+    this.activeCollection = null;
     this.yolo = false;
     this.contextTokens = 0;
     this.sessionLoading = null;
@@ -194,6 +201,10 @@ export class ChronosApp extends LitElement {
         break;
       case "sources":
         this.sources = msg.sources;
+        break;
+      case "collections":
+        this.collections = msg.collections;
+        this.activeCollection = msg.active;
         break;
       case "sessions":
         this.sessions = msg.sessions;
@@ -375,6 +386,26 @@ export class ChronosApp extends LitElement {
           <span class="brand-name">Chronos</span>
         </div>
         <div class="header-controls">
+          ${this.collections.length > 0
+            ? html`<label class="control">
+                <span class="control-label">Collection</span>
+                <select
+                  class="control-select"
+                  .value=${this.activeCollection ?? ""}
+                  @change=${(e: Event) => {
+                    const v = (e.target as HTMLSelectElement).value;
+                    this.postMessage({ type: "selectCollection", id: v === "" ? null : v });
+                  }}
+                >
+                  <option value="" ?selected=${this.activeCollection === null}>All sources</option>
+                  ${this.collections.map(
+                    (c) => html`<option value=${c.id} ?selected=${c.id === this.activeCollection}>
+                      ${c.name} (${c.memberCount})
+                    </option>`,
+                  )}
+                </select>
+              </label>`
+            : nothing}
           <label class="control">
             <span class="control-label">Source</span>
             <select
@@ -387,7 +418,7 @@ export class ChronosApp extends LitElement {
             >
               <option value="" ?selected=${!this.currentSource}>— none —</option>
               ${this.sources.map(
-                (s) => html`<option value=${s.name} ?selected=${s.name === this.currentSource || s.name.endsWith("/" + this.currentSource)}>
+                (s) => html`<option value=${s.name} ?selected=${s.dataKey === this.currentSource}>
                   ${s.name} (${s.pageCount} pp.)
                 </option>`,
               )}

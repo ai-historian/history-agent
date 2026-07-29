@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run the globally-installed `pi` against an ISOLATED agent home, so testing the
+# released/marketplace Chronos agent from a terminal never touches your local-dev
+# registration in ~/.pi/agent. See ../DEV.md.
+#
+# Usage:
+#   dev/pi-release install https://github.com/ai-historian/chronos@v0.2.2   # one-time
+#   dev/pi-release                                                          # run a session
+#
+# Override the isolated home with PI_RELEASE_AGENT_DIR if you like.
+set -euo pipefail
+export PI_CODING_AGENT_DIR="${PI_RELEASE_AGENT_DIR:-$HOME/.pi-release/agent}"
+exec pi "$@"

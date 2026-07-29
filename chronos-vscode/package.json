@@ -75,6 +75,46 @@
           "default": "",
           "scope": "machine",
           "markdownDescription": "**Dev override.** npm package the setup flow installs for the `pi` CLI when pi isn't found. Leave empty for the default `@earendil-works/pi-coding-agent` (the maintained package). Set to override it — e.g. a fork or a version-pinned tag like `@earendil-works/pi-coding-agent@0.79.10`."
+        },
+        "chronos.piAgentDir": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "**Dev override.** Relocates pi's agent home (package registration, `auth.json`, `models.json`, sessions) away from the default `~/.pi/agent`. Accepts an absolute path or a `~/`-prefixed one (e.g. `~/.pi-release/agent`). Set this in a dedicated VS Code profile to test the marketplace build against an isolated agent home without disturbing your local-dev registration in `~/.pi`. The extension both reads this location and passes it to the pi subprocess as `PI_CODING_AGENT_DIR`. Leave empty to use `PI_CODING_AGENT_DIR` from the environment, or the default `~/.pi/agent`."
+        },
+        "chronos.maxExpertToolCalls": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 1000,
+          "markdownDescription": "Maximum number of tool calls a single vision-expert subagent may make while working on one page before it is forced to answer. Higher values let experts self-zoom and explore more (better on dense or damaged pages) at higher cost and latency; lower values keep them terse and cheap. Applies to the `task` / `task_batch` experts. Default: 100."
+        },
+        "chronos.maxConcurrency": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 250,
+          "markdownDescription": "Maximum number of expert subagents `task_batch` runs in parallel. This is both the default when the agent doesn't specify a concurrency and a hard ceiling on what it may request. Higher values finish batches faster but consume more concurrent provider quota (and may hit rate limits). Default: 20."
+        },
+        "chronos.maxImageDimension": {
+          "type": "integer",
+          "default": 2576,
+          "minimum": 0,
+          "markdownDescription": "Maximum long-edge size in **pixels** for images sent to expert vision models (`task`/`task_batch` page context, `view_page`, `view_region`). Larger images are downscaled before upload — providers resize past their own caps anyway (Anthropic: 2576 px), so bigger uploads only waste bandwidth. Lower values shrink uploads roughly quadratically (1568 ≈ 4× smaller than a typical 3000 px scan) at the cost of full-page detail; experts can still zoom via `view_region`, which crops from the full-resolution file on disk. `0` sends originals untouched. Default: 2576."
+        },
+        "chronos.expertRetries": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 10,
+          "markdownDescription": "How many times a failed expert LLM call is retried (exponential backoff ≈2 s/8 s/30 s with jitter) before the page is reported failed. Retries recover pages from transient provider/network failures — timeouts, rate limits, overloads; auth and validation errors are never retried. `0` disables retries. Default: 3."
+        },
+        "chronos.expertRequestTimeout": {
+          "type": "integer",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 3600,
+          "markdownDescription": "Per-attempt timeout in **seconds** for expert LLM calls. Bounds how long a stalled upload or an idle response stream can hold a `task_batch` concurrency slot. `0` uses the provider SDK default (typically 10 minutes). Default: 300."
         }
       }
     },
@@ -138,7 +178,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package",
-    "test": "node esbuild.mjs && node test/run-ui-test.mjs"
+    "build:agent": "npm --prefix ../chronos run build",
+    "test": "npm run build:agent && node esbuild.mjs && node test/collection-id-test.mjs && node test/data-key-equivalence-test.mjs && node test/run-ui-test.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.9",

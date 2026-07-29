@@ -11,20 +11,45 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pageIdToPath } from "../utils/page-files.js";
 import type { ExpertRegistry, ExpertSession } from "./expert-registry.js";
 import { newTaskId } from "./expert-registry.js";
-import type { SourceContext } from "./source-context.js";
-import { requireSource } from "./source-context.js";
+import type { CollectionContext } from "./collection-context.js";
+import { resolveSource, deriveRef, effectiveSourceRef } from "./collection-context.js";
 import { resolveExpertModel } from "../utils/resolve-model.js";
-import { cropImageToBase64, type Bbox } from "../utils/crop-image.js";
+import { cropImageToBuffer, downscaleToLimit, loadImageAsPng, type Bbox } from "../utils/crop-image.js";
 import { appendExpertTurn, type PersistedExpert, type PersistedStep } from "../utils/expert-store.js";
+import { envInt } from "../utils/env-config.js";
+import { completeWithRetry } from "../utils/expert-retry.js";
 import {
   buildExpertTools,
   executeExpertTool,
+  outputOnlyTools,
   rehydrateToolResult,
   type ExpertCapability,
 } from "./expert-tools.js";
 
 // Bound the per-turn agentic loop so a confused expert can't spin on tool calls.
-const MAX_EXPERT_TOOL_CALLS = 8;
+// User-configurable via the extension's `chronos.maxExpertToolCalls` setting,
+// forwarded as CHRONOS_MAX_EXPERT_TOOL_CALLS; defaults to 100.
+const MAX_EXPERT_TOOL_CALLS = envInt("CHRONOS_MAX_EXPERT_TOOL_CALLS", 100, 1, 1000);
+// Absolute ceiling: past the exploratory budget an output-owing expert keeps only
+// save_output (a few retries for invalid JSON), but this hard-stops all tools so
+// the loop always terminates even if it keeps calling save_output.
+const HARD_TOOL_CALL_CEILING = MAX_EXPERT_TOOL_CALLS + 3;
+// Cap the long edge of every image sent to expert models. Providers resize
+// past their own pixel caps anyway (Anthropic: 2576px on Opus 4.7+), so
+// larger uploads are pure wasted bandwidth — at batch concurrency they can
+// saturate the user's uplink. `chronos.maxImageDimension` setting, forwarded
+// as CHRONOS_MAX_IMAGE_DIMENSION; 0 disables. view_region crops are cut from
+// the full-resolution file first, so expert zooming keeps full detail.
+const MAX_IMAGE_DIMENSION = envInt("CHRONOS_MAX_IMAGE_DIMENSION", 2576, 0, 100_000);
+// Per-attempt wall-clock budget, overridable as CHRONOS_EXPERT_TIMEOUT; 0
+// disables. Enforced by ABORTING the attempt, not via pi-ai's timeoutMs
+// option: the Google/Vertex providers ignore timeoutMs entirely and honour
+// only `signal`, so an abort is the only mechanism that bounds every
+// provider. A timed-out attempt is retried and is reported distinctly from a
+// user cancel. `chronos.expertRetries` and `chronos.expertRequestTimeout`
+// settings, forwarded as CHRONOS_EXPERT_RETRIES / CHRONOS_EXPERT_TIMEOUT.
+const EXPERT_RETRIES = envInt("CHRONOS_EXPERT_RETRIES", 3, 0, 10);
+const EXPERT_TIMEOUT_S = envInt("CHRONOS_EXPERT_TIMEOUT", 300, 0, 3600);
 
 const CAP_DESCRIPTION: Record<ExpertCapability, string> = {
   bash: "run shell commands",
@@ -68,19 +93,36 @@ export async function pageImageContent(sourceDir: string, pageId: number, bbox?:
   if (!existsSync(imgPath)) {
     throw new Error(`Page ${String(pageId).padStart(4, "0")} not found: ${imgPath}`);
   }
-  const data = bbox ? await cropImageToBase64(imgPath, bbox) : readFileSync(imgPath).toString("base64");
-  return { type: "image", data, mimeType: "image/png" };
+  const raw = bbox ? await cropImageToBuffer(imgPath, bbox) : readFileSync(imgPath);
+  const capped = await downscaleToLimit(raw, MAX_IMAGE_DIMENSION);
+  return { type: "image", data: capped.toString("base64"), mimeType: "image/png" };
+}
+
+/**
+ * Build the image content block for an arbitrary image file (not a source page),
+ * normalized to a downscaled PNG. Mirrors `pageImageContent`; shared by live
+ * turns and session restore so an image task rehydrates from disk.
+ */
+export async function imageFileContent(imgPath: string): Promise<ImageContent> {
+  const png = await loadImageAsPng(imgPath, MAX_IMAGE_DIMENSION);
+  return { type: "image", data: png.toString("base64"), mimeType: "image/png" };
 }
 
 export interface ExpertTurnInput {
+  /** Collection member ref the expert works on. Optional now — omit for a
+   *  sourceless task (no source-scoped view/save tools). */
+  source?: string;
   /** Continue an existing session; omit to spawn a new one. */
   taskId?: string;
   prompt: string;
   /** provider/model-id; defaults to the session's model on follow-up, else the orchestrator's current model. */
   model?: string;
-  /** Attach this page's image to the message. */
+  /** Attach this source page's image. Requires `source`. */
   pageId?: number;
   bbox?: Bbox;
+  /** Attach an arbitrary image by absolute path (pre-resolved by the caller).
+   *  Mutually exclusive with pageId. */
+  imagePath?: string;
   /** Abort the (multi-call) agentic loop when the user cancels. */
   signal?: AbortSignal;
   /**
@@ -89,6 +131,19 @@ export interface ExpertTurnInput {
    * the caller is responsible for getting the user's confirmation first.
    */
   grantedCaps?: ExpertCapability[];
+  /**
+   * Absolute path the expert must write its result to via `save_output`
+   * (pre-resolved by the caller from output_file). When set, the expert is given
+   * the save_output tool and told to use it; the turn no longer returns its raw
+   * text as the file's contents. Undefined for inline (return-text) tasks.
+   */
+  outputPath?: string;
+  /**
+   * Called as the turn progresses (each completion round-trip and tool call) so
+   * callers can surface live status. Must not throw; failures here must never
+   * fail the turn.
+   */
+  onProgress?: (progress: ExpertProgress) => void;
 }
 
 /** One tool the expert invoked during a turn — surfaced to the UI for oversight. */
@@ -101,6 +156,20 @@ export interface ExpertToolUse {
   isError: boolean;
 }
 
+/** Live snapshot of a running expert turn, streamed to the caller's onProgress. */
+export interface ExpertProgress {
+  /** "thinking" while a completion is in flight; "tool" right after a tool ran. */
+  phase: "thinking" | "tool";
+  /** Total tool calls made so far this turn. */
+  toolCalls: number;
+  /** Name of the most recent tool (set in phase "tool"). */
+  lastTool?: string;
+  /** Task id, once assigned (before the first completion). */
+  taskId?: string;
+  /** Tools invoked so far this turn, in order — lets the UI trace work live. */
+  toolUses: ExpertToolUse[];
+}
+
 export type ExpertTurnResult =
   | {
       ok: true;
@@ -111,11 +180,27 @@ export type ExpertTurnResult =
       pageId: number | null;
       /** view_region/view_page calls the expert made this turn (in order). */
       toolUses: ExpertToolUse[];
+      /** True when an output_file was owed and the expert wrote it via save_output.
+       *  Always false for inline tasks (no output_file). */
+      wroteOutput: boolean;
     }
   | { ok: false; error: string; taskId?: string };
 
 function isToolCall(c: { type: string }): c is ToolCall {
   return c.type === "toolCall";
+}
+
+/** Map persisted intermediate steps to the UI-facing tool-use trace. */
+function stepsToToolUses(steps: PersistedStep[]): ExpertToolUse[] {
+  return steps
+    .filter((s): s is Extract<PersistedStep, { kind: "toolResult" }> => s.kind === "toolResult")
+    .map((s) => ({
+      tool: s.toolResult.toolName,
+      pageId: s.toolResult.image?.pageId,
+      bbox: s.toolResult.image?.bbox,
+      detail: s.toolResult.detail,
+      isError: s.toolResult.isError,
+    }));
 }
 
 /**
@@ -127,7 +212,7 @@ function isToolCall(c: { type: string }): c is ToolCall {
  */
 export async function runExpertTurn(
   registry: ExpertRegistry,
-  sourceCtx: SourceContext,
+  collectionCtx: CollectionContext,
   pageExpertPrompt: string,
   extCtx: ExtensionContext,
   input: ExpertTurnInput,
@@ -136,7 +221,9 @@ export async function runExpertTurn(
     return { ok: false, error: "bbox requires page_id." };
   }
 
-  // Resolve the session first so a follow-up can default to its model.
+  // Resolve the session first so a follow-up can default to its model AND its
+  // source. A follow-up that omits `source` inherits the session's remembered
+  // source, so it keeps its source-scoped view_page/view_region tools.
   let session: ExpertSession | undefined;
   let taskId = input.taskId;
   if (taskId) {
@@ -150,24 +237,58 @@ export async function runExpertTurn(
     }
   }
 
+  // The source in effect this turn — the SAME shared rule view-page.ts uses to
+  // resolve output paths, so the two can no longer disagree about what an empty
+  // `source` on a follow-up means (they did, for one commit).
+  const effectiveSource = effectiveSourceRef(input.source, session?.sourceRef);
+
+  if (input.pageId !== undefined && !effectiveSource) {
+    return { ok: false, taskId, error: "page_id requires a source." };
+  }
+
+  // Resolve the source up-front only when one is in effect. It scopes the attached
+  // page image and the expert's own view_page/view_region tools.
+  let sourceDir: string | undefined;
+  if (effectiveSource) {
+    try {
+      sourceDir = resolveSource(collectionCtx, effectiveSource).path;
+    } catch (e) {
+      return { ok: false, taskId, error: (e as Error).message };
+    }
+  }
+
   // Build the user message; attach a page image only when page_id is given.
+  // The expert's tools always reach the resolved source, image or not.
   const content: (TextContent | ImageContent)[] = [];
   let pageId: number | null = null;
-  let turnSourceDir: string | undefined;
-  if (input.pageId !== undefined) {
-    const sourceDir = requireSource(sourceCtx);
+  if (input.imagePath) {
+    try {
+      content.push(await imageFileContent(input.imagePath));
+    } catch (e) {
+      return { ok: false, taskId, error: (e as Error).message };
+    }
+  } else if (input.pageId !== undefined && sourceDir) {
     pageId = Math.round(input.pageId);
     try {
       content.push(await pageImageContent(sourceDir, pageId, input.bbox));
     } catch (e) {
       return { ok: false, taskId, error: (e as Error).message };
     }
-    turnSourceDir = sourceDir;
-  } else if (sourceCtx.sourceDir) {
-    // No image attached, but a source is active — let the expert's tools reach it.
-    turnSourceDir = sourceCtx.sourceDir;
   }
-  content.push({ type: "text", text: input.prompt });
+  // When an output_file is owed, direct the expert to write via save_output. The
+  // directive is appended to the sent message only; the persisted turn keeps the
+  // clean `input.prompt` (below) so restored history isn't cluttered with it.
+  let promptText = input.prompt;
+  if (input.outputPath) {
+    const jsonHint = input.outputPath.toLowerCase().endsWith(".json")
+      ? " The output file is JSON: pass a single valid JSON value (no code fences, no prose)."
+      : "";
+    promptText +=
+      "\n\n[Output file] You MUST call save_output with your final result — the complete content " +
+      "to write to the output file. Your chat reply is for reasoning only and is NOT saved." +
+      jsonHint;
+  }
+  content.push({ type: "text", text: promptText });
 
   // Default to the session's model on follow-up, else the orchestrator's current
   // model (whatever the user has selected/authed in pi) — no provider is baked in.
@@ -176,17 +297,18 @@ export async function runExpertTurn(
     : extCtx.model
       ? modelSpec(extCtx.model)
       : undefined;
-  const resolved = await resolveExpertModel(input.model, extCtx.modelRegistry, fallback, pageId !== null);
+  const resolved = await resolveExpertModel(input.model, extCtx.modelRegistry, fallback, pageId !== null || !!input.imagePath);
   if (!resolved.ok) {
     return { ok: false, taskId, error: resolved.error };
   }
 
   if (!session) {
     taskId = newTaskId(registry);
-    session = { messages: [], model: resolved.model };
+    session = { messages: [], model: resolved.model, sourceRef: effectiveSource };
     registry.sessions.set(taskId, session);
   } else {
     session.model = resolved.model;
+    if (effectiveSource) session.sourceRef = effectiveSource;
   }
 
   const userMessage: UserMessage = { role: "user", content, timestamp: Date.now() };
@@ -203,32 +325,74 @@ export async function runExpertTurn(
   // consume images; bash/write/edit only for capabilities the orchestrator
   // granted (and the user approved upstream).
   const granted = new Set<ExpertCapability>(input.grantedCaps ?? []);
-  const expertToolDefs = buildExpertTools({
+  const outputMode = !!input.outputPath;
+  let expertToolDefs = buildExpertTools({
     vision: resolved.model.input.includes("image"),
+    hasSource: !!sourceDir,
     granted: [...granted],
+    output: outputMode,
   });
   let toolsEnabled = expertToolDefs.length > 0;
   let totalCost = 0;
+  let wroteOutput = false;
   let finalResponse;
+
+  // Live progress for the caller's UI. Best-effort: a listener bug must never
+  // fail the expert's actual work.
+  const emitProgress = (phase: ExpertProgress["phase"], lastTool?: string): void => {
+    if (!input.onProgress) return;
+    try {
+      input.onProgress({ phase, toolCalls: toolCallCount, lastTool, taskId, toolUses: stepsToToolUses(steps) });
+    } catch {
+      // ignore
+    }
+  };
 
   for (;;) {
     if (input.signal?.aborted) {
       return { ok: false, taskId, error: "Expert turn aborted." };
     }
-    const response = await complete(
-      resolved.model,
-      {
-        systemPrompt: pageExpertPrompt,
-        messages: [...session.messages, ...turnMessages],
-        tools: toolsEnabled ? expertToolDefs : undefined,
-      },
-      { apiKey: resolved.apiKey, headers: resolved.headers, signal: input.signal },
+    emitProgress("thinking");
+    const { response, attempts, timedOut } = await completeWithRetry(
+      (attemptSignal) =>
+        complete(
+          resolved.model,
+          {
+            systemPrompt: pageExpertPrompt,
+            messages: [...session.messages, ...turnMessages],
+            tools: toolsEnabled ? expertToolDefs : undefined,
+          },
+          {
+            apiKey: resolved.apiKey,
+            headers: resolved.headers,
+            signal: attemptSignal,
+          },
+        ),
+      { retries: EXPERT_RETRIES, timeoutMs: EXPERT_TIMEOUT_S * 1000 },
+      input.signal,
     );
-    if (response.stopReason === "error") {
+    // A timed-out attempt that exhausted its retries is reported distinctly
+    // from a genuine user cancel: the composed per-attempt signal aborted,
+    // not the user's own `input.signal`, however the underlying stopReason
+    // ended up looking (error, aborted, or otherwise) after the abort landed.
+    // A response that resolved with neither "error" nor "aborted" is a real
+    // answer — checked first so it can never be discarded as a timeout just
+    // because the per-attempt timer happened to fire at almost the same
+    // moment the call legitimately completed.
+    const responseUsable = response.stopReason !== "error" && response.stopReason !== "aborted";
+    if (timedOut && !input.signal?.aborted && !responseUsable) {
       return {
         ok: false,
         taskId,
-        error: `Expert model error (${modelSpec(resolved.model)}): ${response.errorMessage ?? "unknown error"}`,
+        error: `Expert turn timed out after ${EXPERT_TIMEOUT_S}s per attempt (${attempts} attempts).`,
+      };
+    }
+    if (response.stopReason === "error") {
+      const attemptNote = attempts > 1 ? ` (after ${attempts} attempts)` : "";
+      return {
+        ok: false,
+        taskId,
+        error: `Expert model error (${modelSpec(resolved.model)}): ${response.errorMessage ?? "unknown error"}${attemptNote}`,
       };
     }
     // A cancel that lands while complete() is in flight resolves with an
@@ -250,17 +414,31 @@ export async function runExpertTurn(
     for (const call of toolCalls) {
       toolCallCount++;
       const outcome = await executeExpertTool(call, {
-        sourceDir: turnSourceDir,
+        sourceDir,
         currentPageId,
         cwd: extCtx.cwd,
         granted,
+        outputPath: input.outputPath,
       });
       turnMessages.push(outcome.message);
       steps.push({ kind: "toolResult", toolResult: outcome.persist });
       if (outcome.viewedPageId !== undefined) currentPageId = outcome.viewedPageId;
+      if (outcome.wroteOutput) wroteOutput = true;
+      emitProgress("tool", call.name);
     }
-    // Spent the budget — drop tools so the next completion must answer in text.
-    if (toolCallCount >= MAX_EXPERT_TOOL_CALLS) toolsEnabled = false;
+    // Spent the budget — stop the exploratory tools so the next completion must
+    // answer. When an output_file is still owed, keep ONLY save_output (within a
+    // small grace window) so the expert can still fulfill its contract instead of
+    // being stranded; the hard ceiling then cuts everything off so the loop ends.
+    if (toolCallCount >= HARD_TOOL_CALL_CEILING) {
+      toolsEnabled = false;
+    } else if (toolCallCount >= MAX_EXPERT_TOOL_CALLS) {
+      if (outputMode) {
+        expertToolDefs = outputOnlyTools();
+      } else {
+        toolsEnabled = false;
+      }
+    }
   }
 
   session.messages.push(...turnMessages);
@@ -277,21 +455,14 @@ export async function runExpertTurn(
     prompt: input.prompt,
     pageId: pageId ?? undefined,
     bbox: input.bbox,
-    sourceDir: turnSourceDir,
+    imagePath: input.imagePath,
+    sourceDir,
     steps: steps.length > 0 ? steps : undefined,
     response: finalResponse,
   });
 
   // Surface the expert's tool calls (page/region it pulled in) for UI oversight.
-  const toolUses: ExpertToolUse[] = steps
-    .filter((s): s is Extract<PersistedStep, { kind: "toolResult" }> => s.kind === "toolResult")
-    .map((s) => ({
-      tool: s.toolResult.toolName,
-      pageId: s.toolResult.image?.pageId,
-      bbox: s.toolResult.image?.bbox,
-      detail: s.toolResult.detail,
-      isError: s.toolResult.isError,
-    }));
+  const toolUses: ExpertToolUse[] = stepsToToolUses(steps);
 
   return {
     ok: true,
@@ -301,6 +472,7 @@ export async function runExpertTurn(
     cost: totalCost > 0 ? totalCost : undefined,
     pageId,
     toolUses,
+    wroteOutput,
   };
 }
 
@@ -320,7 +492,13 @@ export async function restoreExpertSessions(
     const messages: Message[] = [];
     for (const turn of rec.turns) {
       const content: (TextContent | ImageContent)[] = [];
-      if (turn.pageId !== undefined && turn.sourceDir) {
+      if (turn.imagePath) {
+        try {
+          content.push(await imageFileContent(turn.imagePath));
+        } catch {
+          // image file no longer on disk — restore this turn text-only
+        }
+      } else if (turn.pageId !== undefined && turn.sourceDir) {
         try {
           content.push(await pageImageContent(turn.sourceDir, turn.pageId, turn.bbox));
         } catch {
@@ -342,7 +520,9 @@ export async function restoreExpertSessions(
     }
     const resolved = await resolveExpertModel(rec.modelSpec, extCtx.modelRegistry, undefined, false);
     if (!resolved.ok) continue;
-    registry.sessions.set(rec.taskId, { messages, model: resolved.model });
+    const lastSourced = [...rec.turns].reverse().find((t) => t.sourceDir);
+    const sourceRef = lastSourced?.sourceDir ? deriveRef(extCtx.cwd, lastSourced.sourceDir) : undefined;
+    registry.sessions.set(rec.taskId, { messages, model: resolved.model, sourceRef });
     const n = parseInt(rec.taskId.replace(/^task-/, ""), 10);
     if (!isNaN(n) && n > maxId) maxId = n;
   }

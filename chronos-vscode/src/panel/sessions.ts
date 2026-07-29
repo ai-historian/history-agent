@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { piAgentDir } from "../pi-env";
 import type { ChronosSessionInfo } from "./webview-protocol";
 
 // Lightweight scan of pi session JSONL files in <workspace>/sessions.
@@ -124,12 +124,12 @@ function generatedName(entry: { name?: string } | string | undefined): string | 
   return entry?.name || undefined;
 }
 
-// pi's default per-project session location: ~/.pi/agent/sessions/--<cwd>--
+// pi's default per-project session location: <agent-dir>/sessions/--<cwd>--
 // (used by sessions created before the extension started pinning
 // PI_CODING_AGENT_SESSION_DIR to <workspace>/sessions).
 function defaultPiSessionDir(workspaceDir: string): string {
   const encoded = `--${resolve(workspaceDir).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  return join(homedir(), ".pi", "agent", "sessions", encoded);
+  return join(piAgentDir(), "sessions", encoded);
 }
 
 function scanDir(

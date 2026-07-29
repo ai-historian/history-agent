@@ -1,12 +1,11 @@
-import { writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { relative } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ExpertRegistry } from "./expert-registry.js";
-import type { SourceContext } from "./source-context.js";
-import { requireSourceDataDir } from "./source-context.js";
+import type { CollectionContext } from "./collection-context.js";
+import { requireSourceDataDir, resolveSource, effectiveSourceRef } from "./collection-context.js";
 import { runExpertTurn, confirmExpertGrant } from "./expert-turn.js";
-import type { ExpertCapability } from "./expert-tools.js";
+import { resolveImagePath, resolveOutputFile, type ExpertCapability } from "./expert-tools.js";
 
 const grantParam = Type.Optional(
   Type.Array(Type.Union([Type.Literal("bash"), Type.Literal("write"), Type.Literal("edit")]), {
@@ -19,6 +18,23 @@ const grantParam = Type.Optional(
 );
 
 const taskParams = Type.Object({
+  source: Type.Optional(
+    Type.String({
+      description:
+        "Collection member ref the expert works on (see the catalog in the system prompt). " +
+        "Optional: required only when you pass page_id, or when the expert should have source-scoped " +
+        "view_page/view_region. Omit for a task on an arbitrary `image` or a plain (text-only) task.",
+    }),
+  ),
+  image: Type.Optional(
+    Type.String({
+      description:
+        "Attach an arbitrary image file by path (workspace-relative, inside the workspace). Use this for " +
+        "a picture that is not a cataloged source page. Mutually exclusive with page_id. Any common image " +
+        "format is accepted (normalized to PNG, downscaled to the image cap). A missing/undecodable file " +
+        "fails the task.",
+    }),
+  ),
   prompt: Type.String({ description: "What to ask the expert model." }),
   task_id: Type.Optional(
     Type.String({
@@ -45,8 +61,14 @@ const taskParams = Type.Object({
   output_file: Type.Optional(
     Type.String({
       description:
-        "If provided, write the model response to this file in the source directory " +
-        "(e.g. 'entries_0042.json'). The tool returns a short confirmation instead of the full text.",
+        "If provided, the expert writes its result to this file " +
+        "(e.g. 'entries_0042.json') itself, via a scoped save_output tool (JSON is validated before " +
+        "writing) — its chat text is not captured. The tool returns a short confirmation; if the " +
+        "expert never calls save_output, no file is written and that is reported. " +
+        "The path is relative to the data directory of the source in effect — the one you pass here, " +
+        "or, on a task_id follow-up that omits `source`, the source that session already works on. " +
+        "Only when no source is in effect at all (a plain task) is it resolved workspace-relative. " +
+        "Restricted/escaping paths are rejected.",
     })
   ),
   bbox: Type.Optional(
@@ -63,8 +85,98 @@ const taskParams = Type.Object({
   grant: grantParam,
 });
 
+/**
+ * The source in effect this call: an explicit `source` wins; otherwise a
+ * task_id follow-up inherits the session's remembered source.
+ *
+ * The rule itself lives in collection-context's `effectiveSourceRef`, which
+ * expert-turn.ts calls too, so the two CANNOT drift apart — they did once, while
+ * the comments here claimed they couldn't. Only the "no source at all" fallback
+ * and ref resolution stay local to outputBaseDir / effectiveSourceRel, since
+ * those genuinely differ (ctx.workspaceDir vs "").
+ */
+const effectiveRef = effectiveSourceRef;
+
+/**
+ * Resolve `ref` via `resolve`, or "" if it throws.
+ *
+ * Both outputBaseDir and effectiveSourceRel need this: a ref that fails to
+ * resolve (an unknown source today; once a later task adds it, also an
+ * ambiguous bare basename matching two members) must not throw out of these
+ * two helpers. That does NOT mean the error is silently lost end-to-end,
+ * though — both call sites in createTaskTool sit right next to a call to
+ * runExpertTurn, which independently resolves this exact same effective ref
+ * via collection-context's resolveSource and surfaces whatever it throws
+ * (including a future ambiguity error) as `result.error` to the user:
+ * outputBaseDir's catch fires *before* that call (so an empty baseDir here
+ * just skips pre-resolving output_file — runExpertTurn still reports the
+ * real error and the task fails there); effectiveSourceRel's catch fires
+ * *after* it, at a point where result.ok is already true, i.e. resolution
+ * of this same ref already succeeded, so the catch is effectively
+ * unreachable there in practice. So this is intentionally an unconditional
+ * catch-all, not narrowed by error type: nothing resolveSource /
+ * requireSourceDataDir throws is ever silently dropped overall — the ""
+ * returned here just means "let runExpertTurn be the one to tell the user
+ * why."
+ */
+function resolveOrEmpty<T>(resolve: () => T): T | "" {
+  try {
+    return resolve();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Base dir for a task's `output_file`.
+ *
+ * An explicit `source` wins; otherwise a task_id follow-up inherits the
+ * session's remembered source (mirroring expert-turn.ts's `effectiveSource`).
+ * Only a genuine plain task — no source anywhere, a supported mode — targets
+ * the workspace root. Returns "" for a ref that does not resolve, so
+ * runExpertTurn reports the source error rather than writing somewhere else.
+ */
+export function outputBaseDir(
+  ctx: CollectionContext,
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string {
+  const effective = effectiveRef(explicitSource, inheritedSource);
+  if (!effective) return ctx.workspaceDir;
+  return resolveOrEmpty(() => requireSourceDataDir(ctx, effective));
+}
+
+/**
+ * The source a `task_id` follow-up inherits — the ref its expert session
+ * remembers. Read from the registry (rebuilt from the persisted expert store on
+ * session start) because that is the very object runExpertTurn consults for its
+ * `effectiveSource`, so the output dir can never disagree with the source the
+ * expert actually views. Undefined for a new task or a sourceless session.
+ */
+function sessionSourceRef(registry: ExpertRegistry, taskId: string | undefined): string | undefined {
+  return taskId ? registry.sessions.get(taskId)?.sourceRef : undefined;
+}
+
+/**
+ * Workspace-relative path of the EFFECTIVE source (same rule as
+ * outputBaseDir: explicit `source` wins, else a task_id follow-up's inherited
+ * source). Feeds details.source/the @path citation, so a sourceless follow-up
+ * — which can still self-zoom via view_page/view_region against the
+ * inherited source — reports the source the expert actually viewed, not
+ * undefined. "" when no source is in effect, or the ref does not resolve.
+ */
+export function effectiveSourceRel(
+  ctx: CollectionContext,
+  explicitSource: string | undefined,
+  inheritedSource: string | undefined,
+): string {
+  const effective = effectiveRef(explicitSource, inheritedSource);
+  if (!effective) return "";
+  return resolveOrEmpty(() => relative(ctx.workspaceDir, resolveSource(ctx, effective).path));
+}
+
 export function createTaskTool(
-  sourceCtx: SourceContext,
+  collectionCtx: CollectionContext,
   registry: ExpertRegistry,
   description: string,
   pageExpertPrompt: string,
@@ -74,7 +186,7 @@ export function createTaskTool(
     label: "Task",
     description,
     parameters: taskParams,
-    async execute(_toolCallId, params, signal, _onUpdate, extCtx) {
+    async execute(_toolCallId, params, signal, onUpdate, extCtx) {
       const grant: ExpertCapability[] = params.grant ?? [];
       if (grant.length > 0 && !(await confirmExpertGrant(extCtx, grant, "this expert"))) {
         return {
@@ -89,14 +201,76 @@ export function createTaskTool(
           details: {},
         };
       }
-      const result = await runExpertTurn(registry, sourceCtx, pageExpertPrompt, extCtx, {
+      if (params.image && params.page_id !== undefined) {
+        return {
+          content: [{ type: "text", text: "`image` and `page_id` are mutually exclusive — pass only one." }],
+          details: {},
+        };
+      }
+      if (params.page_id !== undefined && !params.source) {
+        return {
+          content: [{ type: "text", text: "`page_id` requires a `source`." }],
+          details: {},
+        };
+      }
+      let imagePath: string | undefined;
+      if (params.image) {
+        try {
+          imagePath = resolveImagePath(collectionCtx.workspaceDir, params.image);
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], details: {} };
+        }
+      }
+
+      // Pre-resolve the output path the expert will write to via save_output. If
+      // the source ref is bad, runExpertTurn returns the proper error below, so
+      // just leave outputPath undefined here.
+      let outputPath: string | undefined;
+      if (params.output_file) {
+        // A bad source ref leaves baseDir empty so runExpertTurn reports the source
+        // error; a restricted/escaping output_file is a hard error here (run nothing).
+        const baseDir = outputBaseDir(collectionCtx, params.source, sessionSourceRef(registry, params.task_id));
+        if (baseDir) {
+          try {
+            outputPath = resolveOutputFile(collectionCtx.workspaceDir, baseDir, params.output_file);
+          } catch (e) {
+            return { content: [{ type: "text", text: (e as Error).message }], details: {} };
+          }
+        }
+      }
+
+      const result = await runExpertTurn(registry, collectionCtx, pageExpertPrompt, extCtx, {
+        source: params.source,
         taskId: params.task_id,
         prompt: params.prompt,
         model: params.model,
         pageId: params.page_id,
         bbox: params.bbox,
+        imagePath,
         signal,
         grantedCaps: grant,
+        outputPath,
+        // Stream the expert's live state (phase + tool trace) so the UI card can
+        // show what it is doing instead of a bare spinner.
+        onProgress: onUpdate
+          ? (p) =>
+              onUpdate({
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      p.phase === "tool"
+                        ? `Expert working… ${p.toolCalls} tool ${p.toolCalls === 1 ? "call" : "calls"} (last: ${p.lastTool})`
+                        : "Expert thinking…",
+                  },
+                ],
+                details: {
+                  taskId: p.taskId,
+                  toolUses: p.toolUses,
+                  live: { phase: p.phase, toolCalls: p.toolCalls, lastTool: p.lastTool },
+                },
+              })
+          : undefined,
       });
 
       if (!result.ok) {
@@ -111,28 +285,44 @@ export function createTaskTool(
       const bbox = params.bbox ?? null;
       const costStr = cost !== undefined ? ` [cost: $${cost.toFixed(4)}]` : "";
 
+      // Workspace-relative source path — used both to source-qualify the citation
+      // (@path) and passed in details.source so the expert transcript's page/region
+      // chips open this task's source, not whichever was shown last. Derived from
+      // the same effective source as output_file above (explicit `source` wins,
+      // else the task_id follow-up's inherited source) — see effectiveSourceRel.
+      const sourceRel = effectiveSourceRel(collectionCtx, params.source, sessionSourceRef(registry, params.task_id));
+      const src = sourceRel ? `@${sourceRel}` : "";
       const viewLink =
         pageId === null
           ? ""
           : bbox
-            ? `[view p.${pageId}] [view p.${pageId}#sel=${bbox.x},${bbox.y},${bbox.w},${bbox.h}]\n`
-            : `[view p.${pageId}]\n`;
+            ? `[view p.${pageId}${src}] [view p.${pageId}#sel=${bbox.x},${bbox.y},${bbox.w},${bbox.h}${src}]\n`
+            : `[view p.${pageId}${src}]\n`;
       const trailer = `\ntask_id: ${taskId}`;
 
       if (params.output_file) {
-        const dataDir = requireSourceDataDir(sourceCtx);
-        mkdirSync(dataDir, { recursive: true });
-        const outPath = join(dataDir, params.output_file);
-        writeFileSync(outPath, text || "(empty response)", "utf-8");
+        // The expert writes the file itself via save_output; report from whether it did.
+        const body = result.wroteOutput
+          ? `${viewLink}→ ${params.output_file}${trailer}`
+          : `${viewLink}(expert produced no output — save_output was never called, so no file was written)${trailer}`;
         return {
-          content: [{ type: "text", text: `${viewLink}→ ${params.output_file}${trailer}` }],
-          details: { model, taskId, pageId, bbox, cost: costStr, path: outPath, toolUses },
+          content: [{ type: "text", text: body }],
+          details: {
+            model,
+            taskId,
+            pageId,
+            bbox,
+            cost: costStr,
+            path: result.wroteOutput ? outputPath : undefined,
+            toolUses,
+            source: sourceRel || undefined,
+          },
         };
       }
 
       return {
         content: [{ type: "text", text: `${viewLink}${text || "(empty response)"}${trailer}` }],
-        details: { model, taskId, pageId, bbox, cost: costStr, toolUses },
+        details: { model, taskId, pageId, bbox, cost: costStr, toolUses, source: sourceRel || undefined },
       };
     },
   };

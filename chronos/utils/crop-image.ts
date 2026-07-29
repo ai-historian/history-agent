@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import sharp from "sharp";
 
 export interface Bbox {
@@ -19,6 +20,10 @@ function bboxToPixels(bbox: Bbox, width: number, height: number) {
   const cropW = Math.max(1, Math.min(Math.round(bbox.w * width), width - left));
   const cropH = Math.max(1, Math.min(Math.round(bbox.h * height), height - top));
   return { left, top, cropW, cropH };
+}
+
+function getResizeOptions(maxDim: number) {
+  return { width: maxDim, height: maxDim, fit: "inside" as const, withoutEnlargement: true };
 }
 
 /**
@@ -44,4 +49,35 @@ export async function cropImageToBuffer(imgPath: string, bbox: Bbox): Promise<Bu
 
   const { left, top, cropW, cropH } = bboxToPixels(bbox, width, height);
   return img.extract({ left, top, width: cropW, height: cropH }).png().toBuffer();
+}
+
+/**
+ * Downscale a PNG so its long edge is at most `maxDim` pixels. Returns the
+ * input buffer unchanged when it is already within the cap (no re-encode) or
+ * when maxDim is 0 (disabled). Aspect ratio is preserved.
+ */
+export async function downscaleToLimit(png: Buffer, maxDim: number): Promise<Buffer> {
+  if (maxDim <= 0) return png;
+  const img = sharp(png);
+  const { width, height } = await img.metadata();
+  if (!width || !height || Math.max(width, height) <= maxDim) return png;
+  return img
+    .resize(getResizeOptions(maxDim))
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Load an arbitrary image file and return it as a PNG buffer whose long edge is
+ * at most `maxDim` px (0 = no cap). Always re-encodes to PNG, so any
+ * sharp-readable format is accepted. Throws a clear error for a missing file;
+ * sharp's own error propagates for an undecodable one.
+ */
+export async function loadImageAsPng(imgPath: string, maxDim: number): Promise<Buffer> {
+  if (!existsSync(imgPath)) throw new Error(`Image not found: ${imgPath}`);
+  let img = sharp(readFileSync(imgPath));
+  if (maxDim > 0) {
+    img = img.resize(getResizeOptions(maxDim));
+  }
+  return img.png().toBuffer();
 }

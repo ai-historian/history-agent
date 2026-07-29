@@ -19,18 +19,26 @@ const extensionRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const mockPi = join(extensionRoot, "test", "mock-pi.mjs");
 chmodSync(mockPi, 0o755);
 
-// Fixture workspace: one source; point Chronos at the mock pi.
+// Fixture workspace: one flat source, one nested source (sources/city/Nested_1900 —
+// the agent slugs this to the data key "city--Nested_1900"; a flat basename() read
+// of the directory would wrongly yield "Nested_1900"), plus a second nested source
+// (sources/city/Nested_1875) that the mock pi never sends any viewer message about —
+// suite.js uses it to exercise the COLD dataKeyBySourceDir cache path (citing a
+// nested source the host has never been told the data key for), point Chronos at
+// the mock pi.
 const fixture = join(tmpdir(), `chronos-ui-test-${process.pid}`);
 mkdirSync(join(fixture, "sources", "TestSource", "png"), { recursive: true });
+mkdirSync(join(fixture, "sources", "city", "Nested_1900", "png"), { recursive: true });
+mkdirSync(join(fixture, "sources", "city", "Nested_1875", "png"), { recursive: true });
 mkdirSync(join(fixture, ".vscode"), { recursive: true });
 mkdirSync(join(fixture, ".chronos"), { recursive: true });
-writeFileSync(
-  join(fixture, "sources", "TestSource", "png", "page_0001.png"),
-  Buffer.from(
-    "iVBORw0KGgoAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-    "base64",
-  ),
+const tinyPng = Buffer.from(
+  "iVBORw0KGgoAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64",
 );
+writeFileSync(join(fixture, "sources", "TestSource", "png", "page_0001.png"), tinyPng);
+writeFileSync(join(fixture, "sources", "city", "Nested_1900", "png", "page_0001.png"), tinyPng);
+writeFileSync(join(fixture, "sources", "city", "Nested_1875", "png", "page_0001.png"), tinyPng);
 writeFileSync(join(fixture, ".vscode", "settings.json"), JSON.stringify({ "chronos.piPath": mockPi }, null, 2));
 writeFileSync(join(fixture, ".chronos", ".env"), "");
 

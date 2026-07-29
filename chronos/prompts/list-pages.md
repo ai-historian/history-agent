@@ -1,1 +1,1 @@
-List all available page IDs in the source folder. Returns the first page ID, last page ID, and total count. Always call this first to understand the document extent before sampling.
+List all available page IDs in a source. Pass `source` — the collection member ref (see the catalog in the system prompt). Returns the first page ID, last page ID, and total count. Call this first for a source to understand its extent before sampling.

@@ -5,8 +5,12 @@
 // mock covers several scenarios. Never writes non-JSON to stdout.
 //
 // Scenarios (by message prefix):
-//   "select: …"  → POST a show_page over HTTP (establishes the active source),
-//                  then reply with assistant text "source selected".
+//   "select: …"        → POST a show_page over HTTP (establishes the active
+//                         source), then reply with assistant text "source selected".
+//   "select-nested: …" → same, but for the nested fixture source
+//                         (sources/city/Nested_1900), sending the sourceName the
+//                         real agent would send for it: the slugged data key
+//                         "city--Nested_1900" (basename(dataDir), not basename(path)).
 //   "tool: …"    → emit a tool_execution_start/end (list_pages), then "done".
 //   anything     → emit assistant text "echo: <message>".
 import { createInterface } from "node:readline";
@@ -99,7 +103,17 @@ function emitToolThenAssistant(toolName, text) {
 
 function handlePrompt(message) {
   const m = (message || "").trim();
-  if (m.startsWith("select:")) {
+  if (m.startsWith("select-nested:")) {
+    httpPost({
+      type: "show_page",
+      pageId: 1,
+      totalPages: 1,
+      sourceDir: join(process.cwd(), "sources", "city", "Nested_1900"),
+      sourceName: "city--Nested_1900",
+      bbox: null,
+    });
+    emitAssistant("nested source selected");
+  } else if (m.startsWith("select:")) {
     httpPost({
       type: "show_page",
       pageId: 1,

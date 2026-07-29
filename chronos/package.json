@@ -11,7 +11,8 @@
     "prompts": ["./prompts"]
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "npm run build && node scripts/downscale-canary.mjs && node scripts/retry-canary.mjs && node scripts/timeout-canary.mjs && node scripts/collection-canary.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

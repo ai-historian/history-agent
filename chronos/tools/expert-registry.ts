@@ -11,6 +11,9 @@ export interface ExpertSession {
   messages: Message[];
   /** Resolved model used for this session (updated when a follow-up overrides it). */
   model: Model<Api>;
+  /** Source ref this session is scoped to (remembered so a follow-up that omits
+   *  `source` keeps its source-scoped view tools). Undefined for sourceless tasks. */
+  sourceRef?: string;
 }
 
 export interface ExpertRegistry {

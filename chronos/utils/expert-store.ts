@@ -35,6 +35,8 @@ export interface PersistedTurn {
   bbox?: Bbox;
   /** Source dir the page came from, captured per-turn (the active source can change). */
   sourceDir?: string;
+  /** Absolute path of an arbitrary attached image (not a source page) — rehydrated from disk. */
+  imagePath?: string;
   /**
    * Intermediate agentic steps (assistant tool calls + their results) that
    * preceded the final response. Omitted for plain single-shot turns and for

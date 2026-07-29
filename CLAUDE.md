@@ -30,12 +30,34 @@ cd chronos-vscode && npx tsc --noEmit -p tsconfig.json          # host (src/)
 cd chronos-vscode && npx tsc --noEmit -p webview/tsconfig.json  # webview/
 ```
 
-Tests live in `chronos-vscode/` (no unit-test runner; two node scripts):
+There is no unit-test runner — tests are plain node scripts, split across both packages. Each
+package's `npm test` runs its own set:
 
 ```bash
-node scripts/rpc-spike.mjs [path-to-pi]   # canary: asserts the pi --mode rpc JSONL contract. Run after upgrading the global pi.
-node test/run-ui-test.mjs                 # launches VS Code against a fixture workspace; asserts panel + webview + RPC boot
+cd chronos && npm test                 # builds dist/, then all four agent canaries
+cd chronos-vscode && npm test          # builds the agent + bundle, then host tests + the UI test
 ```
+
+Individually:
+
+```bash
+# chronos/ — canaries import the BUILD OUTPUT (dist/), so they need `npm run build` first
+node scripts/downscale-canary.mjs    # image long-edge cap
+node scripts/retry-canary.mjs        # expert retry/backoff policy
+node scripts/timeout-canary.mjs      # per-attempt timeout enforced by abort, not pi-ai timeoutMs
+node scripts/collection-canary.mjs   # collection context, ids, session sidecar, source precedence
+
+# chronos-vscode/
+node scripts/rpc-spike.mjs [path-to-pi]        # asserts the pi --mode rpc JSONL contract. Run after upgrading the global pi.
+node test/collection-id-test.mjs               # host reads collection id vs display name
+node test/data-key-equivalence-test.mjs        # host's data-key mirror vs the agent's real derivation (needs chronos/dist)
+node test/run-ui-test.mjs                      # launches VS Code against a fixture workspace; panel + webview + RPC boot + nested sources
+```
+
+`test/suite.js` and `test/data-key-equivalence-test.mjs` import `chronos/dist/` to derive their
+expected values instead of hardcoding them, so **a stale `dist` makes them agree with themselves**.
+`npm test` builds the agent first for that reason; if you invoke the scripts directly, build it
+yourself. Note `chronos/dist` is gitignored and survives branch switches.
 
 See `chronos-vscode/TESTING.md` for the manual smoke checklist.
 
@@ -69,7 +91,7 @@ Key tools: `task`/`task_batch` (spawn persistent vision-expert subagents per pag
 
 ### Workspace layout (user-facing, created by `Chronos: Init Workspace`)
 
-A Chronos *workspace* (separate from this repo) contains `sources/<name>/png/page_NNNN.png`, `data/` (outputs), `memory/` (`MEMORY.MD` + per-source `.md`, injected into the system prompt), `skills/<name>/SKILL.md`, `sessions/`, and `.chronos/` (`.env` with provider API keys e.g. `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`, written by the panel's "Log in" flow; `settings.json` for the `yolo` flag; `session-sources.json` mapping session id → selected source for resume; `session-names.json` caching auto-generated session titles). The workspace `skills/` dir is bridged into pi via `.pi/settings.json` (`{ "skills": ["../skills"] }`).
+A Chronos *workspace* (separate from this repo) contains `sources/<name>/png/page_NNNN.png`, `data/` (outputs), `memory/` (`MEMORY.MD` + per-source `.md`, injected into the system prompt), `skills/<name>/SKILL.md`, `sessions/`, and `.chronos/` (`.env` with provider API keys e.g. `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`, written by the panel's "Log in" flow; `settings.json` for the `yolo` flag; `session-collections.json` mapping session id → `{ name?, extraMembers? }` — the selected collection plus any sources added mid-session via `change_source`, replayed on resume; `session-names.json` caching auto-generated session titles). The workspace `skills/` dir is bridged into pi via `.pi/settings.json` (`{ "skills": ["../skills"] }`).
 
 ## Reference
 
