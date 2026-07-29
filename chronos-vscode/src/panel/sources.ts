@@ -66,7 +66,13 @@ export function discoverSources(rootDir: string): SourceInfo[] {
     }
 
     if (existsSync(join(dir, "png")) && statSync(join(dir, "png")).isDirectory()) {
-      sources.push({ name: relative(rootDir, dir), path: dir });
+      // Normalize to forward slashes so this matches the agent's ref exactly.
+      // relative() is platform-native (backslash-joined on win32); the agent's
+      // collectionCtx member ref is always normalized (see collection-context.ts's
+      // deriveRef), and /select-source compares `name` against that ref verbatim
+      // (chronos-panel.ts sends `msg.name` straight through as the ref argument).
+      // Without this, a nested source's name would never match its ref on win32.
+      sources.push({ name: relative(rootDir, dir).replace(/\\/g, "/"), path: dir });
       return;
     }
 

@@ -161,6 +161,19 @@ export function requireSourceDataDir(ctx: CollectionContext, ref: string | undef
  * bare `basename(path)`, so existing `data/<name>/` output dirs keep resolving;
  * nested refs are slugged via `toSlug` so two sources with the same basename
  * under different parents still get distinct data dirs.
+ *
+ * The ref is derived via `deriveRef(workspaceDir, s.path)` rather than using
+ * `discoverSources`'s `s.name` verbatim. `s.name` is `relative(rootDir, dir)` —
+ * platform-native, so `city\Nested_1900` on win32 — and `dataKeyForRef` only
+ * recognizes the slugged-nested case via a forward slash. Using the bare name
+ * there would make `dataKeyForRef` silently fall through to `basename(path)`
+ * on win32, so two differently-nested sources sharing a basename would collide
+ * on the same `data/` dir. `deriveRef` recomputes the same relative path but
+ * always normalizes `\` to `/` before returning, so it's the single place this
+ * normalization lives — every other ref-deriving call site (`replayExtraMembers`,
+ * `change_source`, manifest loading) already goes through it; routing discovery
+ * through it too means all four call sites can never disagree on what a given
+ * source's ref is, on any platform.
  */
 export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDir: string): void {
   ctx.workspaceDir = workspaceDir;
@@ -169,10 +182,11 @@ export function buildCollectionFromDiscovery(ctx: CollectionContext, workspaceDi
   ctx.description = null;
   ctx.members.clear();
   for (const s of discoverSources(join(workspaceDir, "sources"))) {
-    ctx.members.set(s.name, {
-      ref: s.name,
+    const ref = deriveRef(workspaceDir, s.path);
+    ctx.members.set(ref, {
+      ref,
       path: s.path,
-      dataDir: join(workspaceDir, "data", dataKeyForRef(s.name, s.path)),
+      dataDir: join(workspaceDir, "data", dataKeyForRef(ref, s.path)),
     });
   }
 }

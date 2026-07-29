@@ -2,7 +2,7 @@
 // chronos/ after `npm run build`:  node scripts/collection-canary.mjs
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 
 const { createCollectionContext, resolveSource } = await import("../dist/tools/collection-context.js");
 
@@ -377,6 +377,85 @@ function makeSource(ws, rel) {
   const auto = createCollectionContext(ws, null, null);
   check('collectionKey falls back to "all-sources" when id is null',
         collectionKey(auto) === "all-sources", collectionKey(auto));
+}
+
+// --- F1: buildCollectionFromDiscovery's ref must never retain a raw,
+// non-normalized path separator, on any platform ----------------------------
+// discoverSources' `s.name` is `relative(rootDir, dir)` — platform-native, so
+// backslash-joined on win32 (e.g. "city\Nested_1900"). dataKeyForRef only
+// recognizes the slugged-nested case via a forward slash, so using `s.name`
+// verbatim as the ref (instead of routing it through deriveRef, which always
+// normalizes `\` to `/`) would make dataKeyForRef silently fall through to
+// basename(path) on win32 — colliding two differently-nested sources that
+// share a basename onto the same data/ dir.
+//
+// We're on Linux, so real discoverSources output never contains a backslash
+// and this can't be reproduced via actual win32 path semantics. Both blocks
+// below exercise the same class of bug WITHOUT needing Windows:
+{
+  const { discoverSources } = await import("../dist/utils/source-discovery.js");
+  const { deriveRef, dataKeyForRef, buildCollectionFromDiscovery, createCollectionContext: makeCtx } =
+    await import("../dist/tools/collection-context.js");
+
+  // (a) A REAL, unmocked run of the actual (compiled) buildCollectionFromDiscovery
+  // against a directory whose name is a single path component that happens to
+  // contain a literal backslash character (legal on POSIX filesystems). This
+  // is not synthetic: discoverSources really walks it and really returns a
+  // `name`/`s.path` containing that raw backslash byte — the exact shape
+  // `relative()` produces for a NESTED source on an actual win32 host, so it
+  // exercises the true production call chain (discoverSources ->
+  // buildCollectionFromDiscovery -> dataKeyForRef), just via an unusual
+  // filename instead of an unavailable OS.
+  {
+    const ws = workspace();
+    const weirdPath = makeSource(ws, "weird\\Name_1900");
+    const ctx = makeCtx();
+    buildCollectionFromDiscovery(ctx, ws);
+
+    const expectedRef = deriveRef(ws, weirdPath);
+    check("a discovery name containing a literal backslash is normalized to deriveRef's ref",
+          ctx.members.has(expectedRef), `members=${JSON.stringify([...ctx.members.keys()])} expected=${expectedRef}`);
+    check("no member ref retains a raw backslash",
+          [...ctx.members.keys()].every((ref) => !ref.includes("\\")),
+          JSON.stringify([...ctx.members.keys()]));
+    const member = ctx.members.get(expectedRef);
+    check("its dataDir is slugged, not a raw-backslash directory name",
+          member && !basename(member.dataDir).includes("\\"),
+          member ? basename(member.dataDir) : "no member");
+  }
+
+  // (b) The consequence this exists to prevent: two ACTUALLY nested, actually
+  // discovered sources sharing a basename, with their real (forward-slash)
+  // discovered names re-expressed with win32's separator (only the separator
+  // convention changes — same bytes otherwise, "a path built with a literal
+  // backslash segment"). Feeding the win-style name straight into
+  // dataKeyForRef (bypassing deriveRef, i.e. the pre-fix behavior) collides
+  // them onto the same key; normalizing first (deriveRef's own behavior, and
+  // what buildCollectionFromDiscovery is now wired to do) keeps them distinct.
+  {
+    const ws = workspace();
+    const pathA = makeSource(ws, join("city", "Nested_1900"));
+    const pathB = makeSource(ws, join("region", "Nested_1900"));
+    const discovered = discoverSources(join(ws, "sources"));
+    const sA = discovered.find((s) => s.path === pathA);
+    const sB = discovered.find((s) => s.path === pathB);
+    check("sanity: both nested sources were discovered", !!sA && !!sB, JSON.stringify(discovered));
+
+    const winNameA = sA.name.replace(/\//g, "\\");
+    const winNameB = sB.name.replace(/\//g, "\\");
+
+    const buggyKeyA = dataKeyForRef(winNameA, pathA);
+    const buggyKeyB = dataKeyForRef(winNameB, pathB);
+    check("mechanism of the bug: unnormalized win-style refs collide on the same data key",
+          buggyKeyA === buggyKeyB, `A=${buggyKeyA} B=${buggyKeyB}`);
+
+    const fixedKeyA = dataKeyForRef(winNameA.replace(/\\/g, "/"), pathA);
+    const fixedKeyB = dataKeyForRef(winNameB.replace(/\\/g, "/"), pathB);
+    check("normalizing first (deriveRef's behavior) keeps them distinct",
+          fixedKeyA !== fixedKeyB, `A=${fixedKeyA} B=${fixedKeyB}`);
+    check("normalized keys contain no raw backslash",
+          !fixedKeyA.includes("\\") && !fixedKeyB.includes("\\"));
+  }
 }
 
 // --- R18/optional: resolveSessionCollectionSelection is the pure decision
