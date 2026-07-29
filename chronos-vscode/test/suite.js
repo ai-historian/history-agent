@@ -212,9 +212,21 @@ exports.run = async function run() {
   // built to chronos/dist by `cd chronos && npm run build`) rather than
   // hardcoded — a literal like "city--Nested_1900" would just be restating
   // what the mock happens to send, not proving the host derives it correctly.
-  const { deriveRef, dataKeyForRef } = await import(
-    pathToFileURL(join(__dirname, "..", "..", "chronos", "dist", "tools", "collection-context.js")).href
-  );
+  // `npm test` builds chronos/ first, so this import is fresh. Invoked directly
+  // (node test/run-ui-test.mjs) on a checkout that has never built the agent,
+  // chronos/dist does not exist — dist is gitignored — and a bare dynamic
+  // import would surface as an opaque ERR_MODULE_NOT_FOUND from inside the
+  // extension host. Say what to run instead.
+  const collectionContext = join(__dirname, "..", "..", "chronos", "dist", "tools", "collection-context.js");
+  let deriveRef, dataKeyForRef;
+  try {
+    ({ deriveRef, dataKeyForRef } = await import(pathToFileURL(collectionContext).href));
+  } catch (err) {
+    throw new Error(
+      `could not import ${collectionContext} — the agent package is not built. ` +
+        `Run "npm test" (which builds it) or "cd chronos && npm run build" first. Cause: ${err.message}`,
+    );
+  }
   const expectedDataKeyFor = (relSourcePath) => {
     const sourceDir = join(ws, "sources", ...relSourcePath.split("/"));
     return dataKeyForRef(deriveRef(ws, sourceDir), sourceDir);

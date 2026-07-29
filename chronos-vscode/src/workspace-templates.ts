@@ -28,7 +28,8 @@ you **persist as you go** and design for resume. Never hold the whole trace in y
 - Pin down the entity and its bounds with the user if ambiguous: exact name(s) and spelling
   variants, time range, place, and what counts as a match (same person vs. same household).
 - Read **collection memory** (already injected) and, if it exists, the current entity index at
-  \`data/_collections/<collection>/entities.json\` — you may be resuming an earlier run.
+  \`<collection data dir>/entities.json\` — you may be resuming an earlier run. Your system prompt
+  names the exact directory; do not construct the path yourself.
 
 ## 1. Choose which sources to sweep
 
@@ -54,7 +55,8 @@ For each chosen source \`S\`:
 
 ## 3. Reconcile into the entity index
 
-Maintain \`data/_collections/<collection>/entities.json\` — a JSON array of entity rows. Each row
+Maintain \`entities.json\` in the collection data dir named in your system prompt (do not construct
+the path yourself) — a JSON array of entity rows. Each row
 aggregates every place the entity appears, using the reserved keys as **index-aligned lists**:
 
 \`\`\`json

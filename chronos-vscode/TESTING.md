@@ -14,12 +14,42 @@ fact that slash-command `prompt` responses arrive only after the handler
 finishes). Run this after upgrading the global `pi` install to detect protocol
 drift. Last verified: pi 0.79.1 (2026-06-11).
 
+## Agent canaries (`chronos/`)
+
+```
+cd ../chronos && npm test
+```
+
+Builds `dist/` then runs all four canaries — image downscaling, expert
+retry/backoff, per-attempt timeout-as-abort, and collection context (ids,
+session sidecar, source precedence). They import the **build output**, so the
+build step is not optional.
+
+## Host tests
+
+```
+node test/collection-id-test.mjs          # collection id vs display name
+node test/data-key-equivalence-test.mjs   # host data-key mirror vs the agent's real derivation
+```
+
+`data-key-equivalence-test.mjs` imports the agent's compiled `deriveRef`/
+`dataKeyForRef` from `chronos/dist` and compares them against the host's
+`src/panel/data-key.ts` mirror over a case table, with no expected-value literal
+— so the unavoidable duplication across the two packages is self-policing.
+It needs `chronos/dist` built (`npm run build:agent`).
+
 ## VS Code integration test
 
 ```
-npm test            # builds, then runs test/run-ui-test.mjs
+npm test            # builds the agent + bundle, then host tests, then the UI test
 node test/run-ui-test.mjs
 ```
+
+`npm test` builds `chronos/` first because `test/suite.js` derives its expected
+nested-source data keys from `chronos/dist` rather than hardcoding them — a
+**stale or missing `dist` makes the test agree with itself** (or fail with an
+opaque module error). `chronos/dist` is gitignored and survives branch switches,
+so it can silently hold another branch's build.
 
 Launches VS Code (local binary) with the dev extension against a fixture
 workspace and drives it against **`test/mock-pi.mjs`** — a stub that speaks the
@@ -38,6 +68,11 @@ page" hands off to the independent source viewer), and the re-open icon on a
 via a test-only `__test/invoke` / `__test/dump` message pair (see
 `webview-protocol.ts`); the mock varies behavior by prompt prefix
 (`select:` / `tool:` / anything → echo).
+
+**Known flake:** this test failed roughly 1 run in 4 on unchanged code when last
+measured (2026-07-28) — it drives a real VS Code instance with `waitFor` polling,
+so it is timing-sensitive. Treat a single red run as inconclusive: re-run before
+concluding a change broke it, and do not treat one green run as a release gate.
 
 ## Manual smoke checklist (combined viewer + chat UI)
 

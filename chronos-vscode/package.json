@@ -178,7 +178,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package",
-    "test": "node esbuild.mjs && node test/run-ui-test.mjs"
+    "build:agent": "npm --prefix ../chronos run build",
+    "test": "npm run build:agent && node esbuild.mjs && node test/collection-id-test.mjs && node test/data-key-equivalence-test.mjs && node test/run-ui-test.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.9",
