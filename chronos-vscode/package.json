@@ -2,7 +2,7 @@
   "name": "chronos-ai-historian",
   "displayName": "Chronos — The AI Historian",
   "description": "AI-powered assistant that supports historians",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "AI-Historian",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "icon.png",
