@@ -20,13 +20,21 @@ jobs:
             chronos/package-lock.json
             chronos-vscode/package-lock.json
 
-      # chronos pi-package — npm ci resolves the @mariozechner peer deps; tsc emits dist/
+      # chronos pi-package — npm ci resolves the pi peer deps; tsc emits dist/
       - name: Install chronos
         working-directory: chronos
         run: npm ci
       - name: Build chronos (tsc)
         working-directory: chronos
         run: npm run build
+
+      # The agent's canaries (image downscaling, expert retry, timeout-as-abort,
+      # collection context / refs / data keys / session sidecars). They import the
+      # BUILD OUTPUT, so they run after the build above — `npm test` rebuilds anyway.
+      # Nothing in CI exercised these before, so ~140 assertions were local-only.
+      - name: Agent canaries
+        working-directory: chronos
+        run: npm test
 
       # chronos-vscode — esbuild does NOT type-check, so run both tsconfigs explicitly
       - name: Install chronos-vscode
@@ -64,7 +72,19 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: chronos-vscode/package-lock.json
+          cache-dependency-path: |
+            chronos/package-lock.json
+            chronos-vscode/package-lock.json
+
+      # The agent package's OWN devDeps (typescript, @types/node) are required here,
+      # not just chronos-vscode's: `npm test` below builds chronos/ first, because
+      # test/suite.js and test/data-key-equivalence-test.mjs derive their expected
+      # nested-source data keys FROM chronos/dist rather than hardcoding them — a
+      # missing dist fails opaquely inside the extension host, and a stale one makes
+      # those tests agree with themselves.
+      - name: Install chronos (the agent package the tests derive expectations from)
+        working-directory: chronos
+        run: npm ci
 
       - name: Install chronos-vscode
         working-directory: chronos-vscode
@@ -73,8 +93,9 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
-      # npm test = esbuild bundle + run-ui-test.mjs. The test drives a deterministic
-      # mock pi (no real agent / API keys) and downloads VS Code into .vscode-test/.
+      # npm test = build chronos/ + esbuild bundle + host tests + run-ui-test.mjs.
+      # The UI test drives a deterministic mock pi (no real agent / API keys) and
+      # downloads VS Code into .vscode-test/.
       - name: Run UI test
         working-directory: chronos-vscode
         run: xvfb-run -a npm test
