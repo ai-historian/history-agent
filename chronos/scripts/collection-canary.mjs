@@ -58,6 +58,14 @@ function makeSource(ws, rel) {
   check("unresolvable ref -> empty string",
         outputBaseDir(ctx, "Nope", undefined) === "",
         outputBaseDir(ctx, "Nope", undefined));
+
+  // Item A: an explicit source: "" must fall through to the inherited source
+  // too, not just an absent (undefined) explicit source. `??` only falls
+  // through on null/undefined, so source: "" was treated as "no source at
+  // all" and IGNORED the inherited source, writing to the workspace root.
+  check('explicit source: "" falls through to inherited (not the workspace root)',
+        outputBaseDir(ctx, "", "Frankfurt_1864") === dataDir,
+        `got ${outputBaseDir(ctx, "", "Frankfurt_1864")} — workspace root is ${ws}`);
 }
 
 // --- R1: details.source for an inherited source (task_id follow-up) --------
@@ -100,6 +108,11 @@ function makeSource(ws, rel) {
   check("unresolvable ref -> blank",
         effectiveSourceRel(ctx, "Nope", undefined) === "",
         `"${effectiveSourceRel(ctx, "Nope", undefined)}"`);
+
+  // Item A: explicit source: "" falls through to the inherited source here too.
+  check('explicit source: "" falls through to inherited rel path, not blank',
+        effectiveSourceRel(ctx, "", "Frankfurt_1864") === expectRel,
+        `got "${effectiveSourceRel(ctx, "", "Frankfurt_1864")}"`);
 }
 
 // --- Task 4: ambiguous bare basenames must error, not guess -----------------

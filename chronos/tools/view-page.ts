@@ -97,7 +97,12 @@ function effectiveRef(
   explicitSource: string | undefined,
   inheritedSource: string | undefined,
 ): string | undefined {
-  return explicitSource ?? inheritedSource;
+  // `||`, not `??`: an explicit `source: ""` must fall through to the
+  // inherited source too, not just null/undefined. `??` only falls through on
+  // null/undefined, so `source: ""` would be treated as "no source at all"
+  // and IGNORE an inherited source, writing output_file/details.source to the
+  // workspace root instead of the source the follow-up is actually viewing.
+  return explicitSource || inheritedSource;
 }
 
 /**
